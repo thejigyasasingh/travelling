@@ -1,0 +1,28 @@
+# Provisioned rather than clicked. A datasource configured by hand exists only
+# on that machine and is lost when the volume is.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Must match `scrape_interval`. Grafana uses it to pick a sensible step
+      # for range queries; a mismatch produces graphs with gaps that look like
+      # outages.
+      timeInterval: 15s
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Click a request id in a log line, land on the trace. This is what makes
+      # "a guest reported an error at 14:32" a two-minute investigation.
+      derivedFields:
+        - name: request_id
+          matcherRegex: '"request_id":"([^"]+)"'
+          url: '$${__value.raw}'
+          datasourceUid: Prometheus

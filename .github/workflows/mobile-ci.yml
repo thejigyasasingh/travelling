@@ -1,0 +1,132 @@
+# Analyze and test the Flutter app.
+#
+# The app had 195 tests and no pipeline, which is the worst of both: the cost of
+# writing them is paid and the benefit — knowing on every push whether they
+# still pass — is not.
+#
+# Deliberately **not** here:
+#
+# * `dart format --set-exit-if-changed`. The codebase predates Dart's tall-style
+#   formatter and 60 of its 87 files would be rewritten by it. A gate that fails
+#   on its first run gets deleted rather than satisfied; reformatting the tree is
+#   a decision to take on purpose, in its own change, not as a side effect of
+#   adding CI. `flutter analyze` — which does encode real rules — is clean and is
+#   gated below.
+# * A build of the APK or IPA. Both need signing material this workflow has no
+#   business holding, and neither would catch anything `analyze` does not.
+
+name: mobile-ci
+
+on:
+  push:
+    branches: [main]
+    # Both spellings — see the note in backend-ci.yml.
+    paths: &mobile-paths
+      - 'mobile/**'
+      - 'roaming-wandering/mobile/**'
+      - '.github/workflows/mobile-ci.yml'
+  pull_request:
+    paths: *mobile-paths
+
+concurrency:
+  group: mobile-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: mobile
+
+jobs:
+  check:
+    name: analyze · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Pinned to the channel and version the app is developed against.
+          # Flutter's analyzer gains lints between minor releases, so an
+          # unpinned `stable` turns someone else's release into this repo's
+          # red build.
+          flutter-version: '3.41.6'
+          channel: stable
+          cache: true
+
+      - name: Install
+        run: flutter pub get
+
+      # Generated code is checked in, so this verifies the committed output
+      # still matches its sources. A stale `.g.dart` compiles perfectly and
+      # serialises the wrong field names — invisible until a response decodes
+      # to nulls on a real device.
+      - name: Verify generated code is current
+        run: |
+          flutter pub run build_runner build --delete-conflicting-outputs
+          if ! git diff --quiet -- '*.g.dart' '*.freezed.dart'; then
+            echo '::error::Generated code is out of date. Run build_runner and commit the result.'
+            git diff --stat -- '*.g.dart' '*.freezed.dart'
+            exit 1
+          fi
+
+      - name: Analyze
+        run: flutter analyze --fatal-infos
+
+      - name: Test
+        run: flutter test --coverage --reporter=compact
+
+      # Reported, not gated, and for a reason specific to this codebase: the
+      # denominator includes screens and generated serialisation, which is most
+      # of the line count and almost none of the risk. The layer that decides
+      # anything — repositories, the token store, the cache, the error mapper —
+      # sits at 90–100%, and a single blended percentage would hide a drop there
+      # behind a few hundred lines of new JSX-equivalent.
+      - name: Report coverage
+        if: always()
+        run: |
+          echo '### Mobile coverage' >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f coverage/lcov.info ]; then
+            echo '_no coverage produced_' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+
+          rows, cur, hit, total = [], None, 0, 0
+          for line in Path('coverage/lcov.info').read_text().splitlines():
+              if line.startswith('SF:'):
+                  cur, hit, total = line[3:], 0, 0
+              elif line.startswith('DA:'):
+                  total += 1
+                  hit += not line.rsplit(',', 1)[1] == '0'
+              elif line == 'end_of_record' and cur:
+                  rows.append((hit, total, cur))
+                  cur = None
+
+          def pct(subset: list[tuple[int, int, str]]) -> str:
+              h, t = sum(r[0] for r in subset), sum(r[1] for r in subset)
+              return f'{h}/{t} ({h / t:.0%})' if t else 'n/a'
+
+          # Generated code is excluded from the headline: it is a third of the
+          # lines and asserting on it would measure json_serializable.
+          handwritten = [r for r in rows if not r[2].endswith(('.g.dart', '.freezed.dart'))]
+          logic = [r for r in handwritten if '/presentation/screens/' not in r[2]]
+
+          print('| scope | lines |')
+          print('|---|---|')
+          print(f'| everything | {pct(rows)} |')
+          print(f'| hand-written | {pct(handwritten)} |')
+          print(f'| excluding screens | {pct(logic)} |')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-mobile
+          path: mobile/coverage/lcov.info
+          if-no-files-found: ignore

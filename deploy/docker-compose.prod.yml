@@ -1,0 +1,582 @@
+# Production topology.
+#
+# Deliberately a single-host Compose deployment rather than Kubernetes. This is
+# one product with four processes and a database; Compose runs it on one
+# machine with an hour of setup, and the operational surface is a file you can
+# read in one sitting. Move to Kubernetes when you need more than one node, not
+# before — the failure modes it introduces are worse than the ones it solves at
+# this size.
+#
+# What that costs, stated plainly so nobody discovers it during an incident:
+#
+#   * a deploy restarts the API. `stop_grace_period` plus the readiness gate in
+#     `deploy.sh` make it a few seconds of drain, not an outage, but there is
+#     no rolling update across nodes.
+#   * the host is a single point of failure. Postgres is backed up hourly to
+#     off-host storage (see `backup/`), and that is the recovery story.
+#
+# Three networks, and the split is the security boundary:
+#
+#   edge      nginx and the things it proxies to
+#   internal  application to database, cache, queue — no route to the outside
+#   observe   monitoring, which reaches into both but is reachable from neither
+#
+# Postgres and Redis publish **no ports**. They are reachable only from
+# containers on `internal`. A `ports:` line on either of those is the single
+# most common way a database ends up on the public internet.
+
+name: roaming-wandering
+
+x-logging: &logging
+  driver: json-file
+  options:
+    # Promtail ships these to Loki. The rotation here is the safety net for
+    # when Promtail is down — without it a chatty container fills the disk and
+    # takes Postgres with it.
+    max-size: "50m"
+    max-file: "5"
+    # Attached to every line, so a log in Loki knows which service it came
+    # from without parsing the message.
+    tag: "{{.Name}}"
+
+x-restart: &restart
+  # Not `always`: that restarts containers you deliberately stopped, which is
+  # infuriating during an incident.
+  restart: unless-stopped
+
+x-api-env: &api-env
+  APP_ENV: production
+  # Both are already the default, and both are set anyway. `Settings` refuses
+  # to construct in production with either wrong, so an inherited value from
+  # somewhere unexpected is a container that will not start — better to be
+  # explicit than to rely on a default staying put.
+  DEBUG: "false"
+  LOG_FORMAT: json
+  DATABASE__DSN: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  # Blank means "no replica", and the application falls back to the primary.
+  # Deliberately not a nested default with the primary's DSN inside it —
+  # Compose does not expand `${}` inside a `:-` default, so that would have
+  # passed the literal string through and failed to parse.
+  DATABASE__REPLICA_DSN: ${DATABASE_REPLICA_DSN:-}
+  # No database number. The application derives one per subsystem from this
+  # base — cache 0, locks 1, rate limits 2, the Celery broker 3, pub/sub 4 —
+  # so the broker URL is computed, not configured. Setting `CELERY__BROKER_URL`
+  # here would be silently ignored: `CelerySettings` has no such field, and the
+  # broker comes from `RedisSettings.broker_url`.
+  REDIS__URL: redis://:${REDIS_PASSWORD}@redis:6379
+  SECURITY__JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+  SECURITY__JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+  PAYMENT__ENABLED: ${PAYMENT_ENABLED:-true}
+  PAYMENT__RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID}
+  PAYMENT__RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET}
+  PAYMENT__RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET}
+  STORAGE__ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+  STORAGE__ACCESS_KEY: ${S3_ACCESS_KEY}
+  STORAGE__SECRET_KEY: ${S3_SECRET_KEY}
+  STORAGE__BUCKET: ${S3_BUCKET}
+  STORAGE__REGION: ${S3_REGION:-ap-south-1}
+  STORAGE__PUBLIC_BASE_URL: ${CDN_BASE_URL}
+  # Required — the app refuses to boot a deployed environment that cannot send
+  # mail. See the reasoning in the env template.
+  EMAIL__ENABLED: ${EMAIL_ENABLED:-true}
+  EMAIL__HOST: ${SMTP_HOST}
+  EMAIL__PORT: ${SMTP_PORT:-587}
+  EMAIL__USERNAME: ${SMTP_USERNAME:-}
+  EMAIL__PASSWORD: ${SMTP_PASSWORD:-}
+  EMAIL__START_TLS: ${SMTP_START_TLS:-true}
+  EMAIL__TLS: ${SMTP_TLS:-false}
+  EMAIL__FROM_ADDRESS: ${EMAIL_FROM_ADDRESS}
+  EMAIL__FROM_NAME: ${EMAIL_FROM_NAME:-Roaming & Wandering}
+  EMAIL__REPLY_TO: ${EMAIL_REPLY_TO:-}
+  EMAIL__WEB_BASE_URL: ${EMAIL_WEB_BASE_URL}
+  AI__ENABLED: ${AI_ENABLED:-false}
+  AI__API_KEY: ${AI_API_KEY:-}
+  OBSERVABILITY__IP_HASH_SALT: ${IP_HASH_SALT:-}
+  OBSERVABILITY__SENTRY_DSN: ${SENTRY_DSN:-}
+  OBSERVABILITY__OTEL_ENDPOINT: ${OTEL_ENDPOINT:-}
+  HTTP__CORS_ORIGINS: ${CORS_ORIGINS}
+  # **Required.** The default is `["*"]`, and `Settings` refuses to start in
+  # production with a wildcard here — deliberately: the application builds
+  # absolute URLs from the Host header, so a wildcard lets an attacker send
+  # `Host: evil.example` and have a password-reset link point there.
+  #
+  # Accepts a comma-separated list as well as JSON.
+  HTTP__ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+
+services:
+  # ══════════════════════════════════════════════════════════════════════
+  # Data
+  # ══════════════════════════════════════════════════════════════════════
+  postgres:
+    image: postgis/postgis:17-3.5
+    <<: *restart
+    logging: *logging
+    networks: [internal]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # scram-sha-256, not md5. md5 is trivially crackable offline from a
+      # captured hash and Postgres only defaults to it for old-client
+      # compatibility we do not need.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    command:
+      - postgres
+      # Tuned for a 4 GB host. Recalculate for the real machine —
+      # shared_buffers ≈ 25% of RAM, effective_cache_size ≈ 60-75%.
+      - -c=shared_buffers=1GB
+      - -c=effective_cache_size=3GB
+      - -c=maintenance_work_mem=256MB
+      - -c=work_mem=16MB
+      - -c=max_connections=200
+      # SSD: random reads cost about the same as sequential, so the planner
+      # should stop avoiding index scans.
+      - -c=random_page_cost=1.1
+      - -c=effective_io_concurrency=200
+      # Log anything over a second. The single most useful setting here.
+      - -c=log_min_duration_statement=1000
+      - -c=log_checkpoints=on
+      - -c=log_lock_waits=on
+      - -c=log_temp_files=0
+      # Keeps a week of query statistics for pg_stat_statements, which is what
+      # you read when "the site is slow" and nobody knows why.
+      - -c=shared_preload_libraries=pg_stat_statements
+      - -c=pg_stat_statements.max=10000
+      - -c=track_io_timing=on
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # `-U` and `-d` explicitly: without them pg_isready checks the *default*
+      # database, which exists before the real one finishes initialising, and
+      # dependents start against a database with no schema.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 60s
+    shm_size: 256mb          # parallel query workers need it; the 64 MB default causes errors
+
+  redis:
+    image: redis:7.4-alpine
+    <<: *restart
+    logging: *logging
+    networks: [internal]
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --maxmemory
+      - 512mb
+      # `allkeys-lru`, not `noeviction`. Redis here holds caches, rate-limit
+      # counters and Celery queues; under memory pressure, evicting a cache
+      # entry is right and refusing a write would fail bookings.
+      - --maxmemory-policy
+      - allkeys-lru
+      # AOF on: Celery queues live here, and losing the tail on a restart loses
+      # queued refunds. `everysec` is the usual trade — at most one second of
+      # writes, without an fsync per command.
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # Renamed rather than disabled entirely: FLUSHALL from a compromised app
+      # container wipes every queue, and nothing legitimate calls it.
+      - --rename-command
+      - FLUSHALL
+      - ""
+      - --rename-command
+      - FLUSHDB
+      - ""
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    stop_grace_period: 30s
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Application
+  # ══════════════════════════════════════════════════════════════════════
+
+  # Runs to completion before the API starts, and never at the same time as
+  # another copy of itself — Alembic takes an advisory lock, so a second one
+  # waits rather than racing.
+  migrate:
+    image: ${REGISTRY}/backend:${TAG}
+    command: ["migrate"]
+    environment: *api-env
+    networks: [internal]
+    secrets: [jwt_private_key, jwt_public_key]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+    logging: *logging
+
+  api:
+    image: ${REGISTRY}/backend:${TAG}
+    command: ["api"]
+    <<: *restart
+    logging: *logging
+    networks: [internal, edge, observe]
+    environment: *api-env
+    secrets: [jwt_private_key, jwt_public_key]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      # Liveness, not readiness. A readiness probe here would restart every
+      # API container during a database blip — turning a recoverable incident
+      # into a crash loop that prevents recovery.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health/live || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # Longer than the longest request. SIGTERM stops accepting, in-flight
+    # requests finish, then the process exits — which is what makes a deploy
+    # invisible to someone mid-checkout.
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 1536M}
+        reservations: {cpus: "0.5", memory: 512M}
+
+  worker:
+    image: ${REGISTRY}/backend:${TAG}
+    command: ["worker"]
+    <<: *restart
+    logging: *logging
+    networks: [internal, observe]
+    environment: *api-env
+    secrets: [jwt_private_key, jwt_public_key]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.infrastructure.queue.celery_app:celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 45s
+    # Long. A worker mid-refund must finish it: killing the process between
+    # calling Razorpay and recording the result leaves money moved with no
+    # record of it.
+    stop_grace_period: 120s
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 1536M}
+
+  beat:
+    image: ${REGISTRY}/backend:${TAG}
+    command: ["beat"]
+    <<: *restart
+    logging: *logging
+    networks: [internal]
+    environment: *api-env
+    secrets: [jwt_private_key, jwt_public_key]
+    depends_on:
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    # **Exactly one.** Two beats double every scheduled job — two reconcile
+    # passes, two expiry sweeps. The tasks are idempotent, so this is a cost
+    # problem rather than a correctness one, but it is still wrong.
+    deploy:
+      replicas: 1
+      resources:
+        limits: {cpus: "0.5", memory: 384M}
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Static front ends
+  # ══════════════════════════════════════════════════════════════════════
+  web:
+    image: ${REGISTRY}/web:${TAG}
+    <<: *restart
+    logging: *logging
+    networks: [edge]
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 128M}
+
+  admin:
+    image: ${REGISTRY}/admin:${TAG}
+    <<: *restart
+    logging: *logging
+    networks: [edge]
+    deploy:
+      resources:
+        limits: {cpus: "0.25", memory: 96M}
+
+  vendor:
+    image: ${REGISTRY}/vendor:${TAG}
+    <<: *restart
+    logging: *logging
+    networks: [edge]
+    deploy:
+      resources:
+        limits: {cpus: "0.25", memory: 96M}
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Edge
+  # ══════════════════════════════════════════════════════════════════════
+  nginx:
+    image: nginx:1.27-alpine
+    <<: *restart
+    logging: *logging
+    networks: [edge, observe]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - certbot-conf:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
+      - nginx-logs:/var/log/nginx
+    depends_on: [api, web, admin, vendor]
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Reload every six hours so a renewed certificate is picked up without a
+    # restart. nginx caches certificate files at startup and will happily serve
+    # an expired one for weeks otherwise.
+    command: >
+      sh -c "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"
+
+  certbot:
+    image: certbot/certbot:latest
+    logging: *logging
+    volumes:
+      - certbot-conf:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    # Twice a day, as Let's Encrypt asks. `renew` is a no-op outside the
+    # thirty-day window, so this is cheap; the randomised sleep spreads load on
+    # their infrastructure and is a condition of the free service.
+    entrypoint: >
+      sh -c "trap exit TERM; while :; do
+        certbot renew --webroot --webroot-path=/var/www/certbot --quiet;
+        sleep 12h & wait $${!};
+      done"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Backups
+  # ══════════════════════════════════════════════════════════════════════
+  backup:
+    build:
+      context: ./backup
+    <<: *restart
+    logging: *logging
+    networks: [internal]
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      AWS_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: ${BACKUP_S3_REGION:-ap-south-1}
+      # Age-encrypted before it leaves the host. A dump on object storage is a
+      # complete copy of every guest's personal data; the bucket's own
+      # encryption protects it from the disk, not from whoever holds the
+      # bucket credentials.
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      HEALTHCHECK_PING_URL: ${BACKUP_PING_URL:-}
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Observability
+  # ══════════════════════════════════════════════════════════════════════
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 30 days locally. Longer belongs in remote write to something built for
+      # it; a Prometheus holding a year of data is a Prometheus that takes
+      # twenty minutes to restart.
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=8GB
+      - --web.enable-lifecycle          # reload rules without a restart
+      # Never published. Reachable only from Grafana on `observe`, and through
+      # an SSH tunnel for a human. Prometheus has no authentication of its own.
+      - --web.listen-address=0.0.0.0:9090
+    deploy:
+      resources:
+        limits: {memory: 1024M}
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      PAGERDUTY_ROUTING_KEY: ${PAGERDUTY_ROUTING_KEY:-}
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+
+  grafana:
+    image: grafana/grafana:11.5.0
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    # Bound to loopback, not published. Reached over an SSH tunnel:
+    #   ssh -L 3000:localhost:3000 deploy@host
+    # A Grafana on the public internet is a dashboard of your traffic, your
+    # error rates and your revenue, behind one password.
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      # Off. It phones home with usage data and this instance is not on the
+      # internet anyway.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus, loki]
+
+  loki:
+    image: grafana/loki:3.3.2
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    volumes:
+      - ./monitoring/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/loki.yml
+    deploy:
+      resources:
+        limits: {memory: 768M}
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    volumes:
+      - ./monitoring/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      # Read-only, and that matters: this container reads every other
+      # container's stdout. Write access would let it forge them.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nginx-logs:/var/log/nginx:ro
+      - promtail-positions:/tmp/positions
+    command: -config.file=/etc/promtail/promtail.yml
+    depends_on: [loki]
+
+  # ── exporters ─────────────────────────────────────────────────────────
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    <<: *restart
+    logging: *logging
+    networks: [internal, observe]
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    <<: *restart
+    logging: *logging
+    networks: [internal, observe]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      redis: {condition: service_healthy}
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - --path.rootfs=/host
+      # Disk-full is the failure that takes down Postgres, and it is the one a
+      # host-level exporter catches and an application never will.
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.51.0
+    <<: *restart
+    logging: *logging
+    networks: [observe]
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      # The default collects far more than is useful and costs real CPU.
+      - --docker_only=true
+      - --housekeeping_interval=15s
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    # No route out. A compromised application container cannot exfiltrate over
+    # this network — it would have to use `edge`, where egress is at least
+    # visible in the nginx logs.
+    internal: true
+  observe:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  loki-data:
+  promtail-positions:
+  certbot-conf:
+  certbot-www:
+  nginx-logs:
+
+secrets:
+  # Files on the host, mounted at /run/secrets — not environment variables.
+  # An env var is visible in `docker inspect`, in a crash dump, and in the
+  # process list of anything that shells out.
+  jwt_private_key:
+    file: ./secrets/jwt_private_key.pem
+  jwt_public_key:
+    file: ./secrets/jwt_public_key.pem

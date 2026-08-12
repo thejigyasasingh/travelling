@@ -1,0 +1,16 @@
+# Everything in here grants read/write on every guest record, or the ability to
+# move money. None of it belongs in git — and `security.yml` scans the full
+# history, because a secret committed and removed in the next commit is still
+# in the repository and still needs rotating.
+
+.env
+.env.*
+!env/*.example
+
+secrets/
+*.pem
+*.key
+age-key.txt
+
+.deploy-state
+*.bak

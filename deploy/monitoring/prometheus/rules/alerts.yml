@@ -1,0 +1,306 @@
+# Alerts.
+#
+# Every rule here answers yes to one question: **would you want to be woken up
+# for this?** If not, it belongs on a dashboard. An alert nobody acts on trains
+# people to ignore the channel, and then the one that mattered is ignored too.
+#
+# So there is no "CPU above 80%" rule. High CPU is not a problem; slow requests
+# and failed bookings are, and those are measured directly. Each rule states
+# the user-visible consequence in its annotation, because that is what the
+# person reading it at 3am needs and it is not reconstructible from the
+# expression.
+#
+# `for:` is chosen per rule from how long the condition can be transient. Too
+# short and a deploy pages someone; too long and an outage runs unattended.
+
+groups:
+  # ══════════════════════════════════════════════════════════════════════
+  - name: availability
+    rules:
+      - alert: APIDown
+        expr: up{job="api"} == 0
+        for: 1m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "The API is not responding to scrapes"
+          description: >
+            No metrics from the API for a minute. If this is not a deploy, the
+            site is down: no search, no bookings, no sign-in.
+          runbook: "docker compose -f docker-compose.prod.yml logs --tail=200 api"
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "Postgres is unreachable"
+          description: >
+            Everything is down. The API will be returning 503 from its
+            readiness check and every write is failing.
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 2m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "Redis is unreachable"
+          description: >
+            Sessions, rate limits and the Celery queues live here. Bookings
+            still work — inventory holds are in Postgres — but refunds and
+            emails stop being processed, and rate limiting fails open.
+
+      - alert: WorkerDown
+        expr: up{job="worker"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "No Celery worker is reporting"
+          description: >
+            Background work has stopped: refunds are not being issued, held
+            inventory is not being released, payments are not being reconciled.
+            Guests see nothing wrong until a refund does not arrive.
+          # Five minutes rather than one: a worker restart during a deploy is
+          # normal and a page for it is noise.
+
+  # ══════════════════════════════════════════════════════════════════════
+  - name: latency-and-errors
+    rules:
+      - alert: HighErrorRate
+        # Ratio, not a count. A hundred 5xx an hour is fine at ten thousand
+        # requests a minute and an emergency at ten.
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m])) > 0.02
+        for: 5m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "More than 2% of requests are failing"
+          description: >
+            {{ $value | humanizePercentage }} of requests are returning 5xx.
+            One in fifty visitors is hitting an error page.
+
+      - alert: CheckoutFailing
+        # The endpoint that takes money gets its own rule and a much lower
+        # threshold. A 2% failure rate on search is an annoyance; on payment
+        # confirmation it is lost revenue and a support queue.
+        expr: |
+          sum(rate(http_requests_total{status=~"5..", path=~"/api/v1/(bookings|payments).*"}[5m]))
+            / sum(rate(http_requests_total{path=~"/api/v1/(bookings|payments).*"}[5m])) > 0.005
+        for: 3m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "Bookings or payments are failing"
+          description: >
+            {{ $value | humanizePercentage }} of booking and payment requests
+            are erroring. People are trying to give us money and cannot.
+
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 latency above 2 seconds"
+          description: >
+            The slowest one in twenty requests is taking over two seconds.
+            Usually a slow query or a saturated connection pool — check
+            pg_stat_statements before restarting anything.
+
+  # ══════════════════════════════════════════════════════════════════════
+  - name: database
+    rules:
+      - alert: ConnectionPoolNearlyFull
+        expr: |
+          sum(pg_stat_activity_count) by (instance)
+            / on(instance) pg_settings_max_connections > 0.8
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Postgres connections above 80% of the limit"
+          description: >
+            At 100% every new request fails to get a connection. Either
+            traffic has grown past the pool settings or something is leaking
+            connections — check for long-idle transactions first.
+
+      - alert: LongRunningTransaction
+        # The specific danger: an idle-in-transaction session holds locks and
+        # blocks autovacuum, so bloat grows until the disk fills.
+        expr: pg_stat_activity_max_tx_duration{state="idle in transaction"} > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "A transaction has been idle for over five minutes"
+          description: >
+            It is holding locks and blocking vacuum. Left alone this becomes
+            table bloat and eventually a full disk.
+
+      - alert: ReplicationLagging
+        expr: pg_replication_lag_seconds > 30
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The read replica is more than 30s behind"
+          description: >
+            Admin reports and vendor dashboards read the replica and are now
+            showing stale figures. Bookings are unaffected — they use the
+            primary.
+
+  # ══════════════════════════════════════════════════════════════════════
+  - name: queues-and-jobs
+    rules:
+      - alert: QueueBacklog
+        expr: redis_list_length{key=~"celery|critical"} > 1000
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Over a thousand jobs queued for ten minutes"
+          description: >
+            Workers are not keeping up. Refunds and notifications are being
+            delayed; the queue will drain on its own if this is a burst, and
+            will not if a worker is wedged.
+
+      - alert: OutboxNotDraining
+        # The outbox is how every cross-module event moves. If it stalls,
+        # nothing breaks loudly — refunds simply never start, and sentiment
+        # analysis never runs.
+        expr: outbox_unprocessed_total > 500
+        for: 15m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "The outbox is not draining"
+          description: >
+            {{ $value }} events are unprocessed. Cross-module work has stopped:
+            refunds requested by cancellations are not reaching the payment
+            module. Check the beat container first — the relay is scheduled.
+
+  # ══════════════════════════════════════════════════════════════════════
+  - name: host-and-certificates
+    rules:
+      - alert: DiskFillingUp
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"}) < 0.15
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Less than 15% disk free"
+          description: >
+            Postgres stops accepting writes on a full disk and does not always
+            recover cleanly. Usual culprits: log files, an unrotated WAL, or
+            Loki chunks.
+
+      - alert: DiskCritical
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"}) < 0.05
+        for: 2m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "Less than 5% disk free — act now"
+          description: "Postgres is minutes from refusing writes."
+
+      - alert: CertificateExpiringSoon
+        # Renewal runs twice a day inside a thirty-day window, so anything
+        # under fourteen days means renewal has been failing for a fortnight.
+        expr: probe_ssl_earliest_cert_expiry - time() < 14 * 86400
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "TLS certificate expires in under two weeks"
+          description: >
+            Automatic renewal has not succeeded. Check the certbot container.
+            At expiry every browser refuses the site outright.
+
+      - alert: MemoryPressure
+        expr: |
+          (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Under 10% memory available"
+          description: >
+            The OOM killer chooses the largest process, which is Postgres.
+            That is an unclean shutdown and a recovery on restart.
+
+  # ══════════════════════════════════════════════════════════════════════
+  - name: notifications
+    rules:
+      - alert: NotificationsFailing
+        # Nobody watches an inbox that stays empty. A mailer that stops working
+        # produces no errors a user can report — they simply never receive the
+        # verification link, conclude the signup is broken, and leave. This
+        # platform shipped in exactly that state, undetected, for its whole
+        # early life.
+        expr: >
+          sum(rate(notifications_total{outcome="failed"}[15m]))
+          /
+          clamp_min(sum(rate(notifications_total[15m])), 0.001)
+          > 0.2
+        for: 15m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "More than 20% of notifications are failing"
+          description: >
+            Check the provider first — a rejected From address and a refused
+            connection look the same from here. `notifications` rows carry the
+            exception in `error`, and the send is retried five times with
+            backoff, so a short provider blip will not reach this threshold.
+
+      - alert: NotificationsSuppressed
+        # Not a failure — a misconfiguration. `EMAIL__ENABLED=false` records
+        # every message as `suppressed` and carries on, which is the right
+        # behaviour and completely invisible without this.
+        expr: sum(rate(notifications_total{outcome="suppressed"}[15m])) > 0
+        for: 10m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "Notifications are being suppressed — the mailer is switched off"
+          description: >
+            `EMAIL__ENABLED` is false in a deployed environment. No user can
+            verify an address or reset a password while this is true. Settings
+            refuse to boot production this way, so this most likely means
+            staging.
+
+      - alert: NoNotificationsAtAll
+        # The failure the two rules above cannot see: nothing is being *sent*.
+        # A dead worker, an unregistered task or a stalled outbox all produce
+        # zero of everything, and a ratio over zero traffic is not a signal.
+        expr: sum(rate(notifications_total[1h])) == 0
+        for: 2h
+        labels: {severity: warning, page: "false"}
+        annotations:
+          summary: "No notification has been attempted in two hours"
+          description: >
+            Expected overnight on a quiet platform, and suspicious during the
+            day. Check that the Celery worker is consuming `critical` and that
+            the outbox relay is draining — an undrained outbox is silent.
+
+  # ══════════════════════════════════════════════════════════════════════
+  - name: backups
+    rules:
+      - alert: BackupMissing
+        # The one rule that pages for something that is not currently broken.
+        # A failed backup costs nothing today and everything on the day of a
+        # restore — and it is the failure most likely to go unnoticed, because
+        # nothing else changes.
+        expr: time() - backup_last_success_timestamp_seconds > 26 * 3600
+        for: 30m
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "No successful database backup in 26 hours"
+          description: >
+            Every hour that passes is an hour of data that cannot be recovered.
+            Check the backup container's logs; the dump is verified after
+            upload, so a failure here may mean the *verification* failed rather
+            than the dump.
+
+      - alert: BackupRestoreCheckFailing
+        expr: backup_verify_success == 0
+        for: 1h
+        labels: {severity: critical, page: "true"}
+        annotations:
+          summary: "The backup verification restore failed"
+          description: >
+            A dump exists but did not restore into a scratch database. An
+            unverified backup is not a backup — treat this as having none.

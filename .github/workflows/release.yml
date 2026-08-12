@@ -1,0 +1,226 @@
+# Build, scan, push, deploy.
+#
+# Runs on a tag, not on every push to main. A deployment should be a deliberate
+# act with a name you can say out loud during an incident — "we're on v1.4.2" —
+# rather than "whatever merged forty minutes ago".
+#
+# Images are tagged with the **commit SHA**, and the release tag is an
+# additional pointer at the same digest. The SHA is what `deploy.sh` pins,
+# because a moving tag means a container restarted six weeks later comes back
+# as a different build.
+#
+# The order matters and is enforced by `needs:`: nothing is pushed until tests
+# pass, nothing is deployed until the image is scanned.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Where to deploy
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+concurrency:
+  # Never two deployments at once. Not cancel-in-progress: interrupting a
+  # deployment halfway leaves the stack in a state nobody chose.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  # Cosign signs with a short-lived certificate tied to this workflow's
+  # identity, so a signature proves *which workflow* built the image and there
+  # is no long-lived signing key to steal.
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  test:
+    name: full test suite
+    uses: ./.github/workflows/backend-ci.yml
+
+  # ══════════════════════════════════════════════════════════════════════
+  build:
+    name: build ${{ matrix.image }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: backend
+            context: backend
+            dockerfile: backend/docker/Dockerfile
+          - image: web
+            context: frontend
+            dockerfile: frontend/docker/Dockerfile
+          - image: admin
+            context: admin
+            dockerfile: admin/docker/Dockerfile
+          - image: vendor
+            context: vendor
+            dockerfile: vendor/docker/Dockerfile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Registry cache, not GitHub's: it survives across branches and does
+          # not count against the 10 GB Actions cache quota, which four images
+          # exhaust in a week.
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:buildcache,mode=max
+          provenance: true
+          sbom: true
+          # Public configuration only. Nothing secret may be a build arg for a
+          # frontend — every VITE_* value ends up in a file the browser
+          # downloads.
+          build-args: |
+            VITE_API_BASE_URL=/api/v1
+            VITE_RAZORPAY_KEY_ID=${{ vars.RAZORPAY_KEY_ID }}
+            VITE_SENTRY_DSN=${{ vars.SENTRY_DSN }}
+            VITE_APP_VERSION=${{ github.sha }}
+
+      # Fails the build on a fixable HIGH or CRITICAL. `ignore-unfixed` is
+      # deliberate: blocking on a CVE with no patch available stops all
+      # deployments including the ones that fix other CVEs, and the team
+      # learns to pass `--skip`.
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.image }}.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # Uploaded even when the scan failed, so the findings are readable in the
+      # Security tab rather than only in a red log.
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.image }}.sarif
+          category: trivy-${{ matrix.image }}
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image
+        run: |
+          cosign sign --yes \
+            "${IMAGE_PREFIX}/${{ matrix.image }}@${{ steps.push.outputs.digest }}"
+
+  # ══════════════════════════════════════════════════════════════════════
+  deploy:
+    name: deploy to ${{ inputs.environment || 'production' }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # A GitHub environment, which is where the required-reviewer rule lives.
+    # Production deploys wait for a human to approve; staging does not.
+    environment:
+      name: ${{ inputs.environment || 'production' }}
+      url: https://roamingwandering.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Longer than the deploy script's own readiness wait, so a slow
+          # start-up is not cut off mid-rollback.
+          command_timeout: 15m
+          script: |
+            set -Eeuo pipefail
+            cd /srv/roaming-wandering
+            # The repository on the host is only for the compose file and the
+            # config it mounts. Application code comes from the registry.
+            git fetch --tags --quiet
+            git checkout --quiet ${{ github.sha }}
+            cd deploy
+            ./scripts/deploy.sh ${{ github.sha }}
+
+      # From outside, over the real DNS and the real certificate. The
+      # in-container readiness check the deploy script uses cannot see a broken
+      # nginx config, an expired certificate, or a firewall rule.
+      - name: Smoke test from outside
+        run: |
+          set -Eeuo pipefail
+          base=https://roamingwandering.com
+
+          echo "→ the site loads"
+          curl -fsS -o /dev/null "$base/"
+
+          echo "→ the API is ready"
+          curl -fsS "$base/api/v1/health/ready" | grep -q '"status":"ready"'
+
+          echo "→ search answers"
+          curl -fsS -o /dev/null "$base/api/v1/search?city=Goa"
+
+          echo "→ HSTS is set"
+          curl -fsSI "$base/" | grep -qi 'strict-transport-security'
+
+          echo "→ the docs are NOT public"
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$base/api/v1/docs")" = "403"
+
+          echo "→ metrics are NOT public"
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$base/metrics")" = "403"
+
+      - name: Report
+        if: always()
+        run: |
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "✅ Deployed \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "❌ Deployment failed."
+              echo ""
+              echo "\`deploy.sh\` rolls back automatically if the new version"
+              echo "never became ready. If it did not get that far, the old"
+              echo "version is still running and nothing was restarted."
+              echo ""
+              echo "On the host: \`cd /srv/roaming-wandering/deploy && ./scripts/deploy.sh --rollback\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

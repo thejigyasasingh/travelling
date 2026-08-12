@@ -1,0 +1,68 @@
+name: roaming_wandering
+description: Roaming & Wandering — book hotels, villas, apartments, homestays and resorts across India.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State. Riverpod over provider/bloc because a provider is a *value* with a
+  # declared lifetime: the dependency graph is compile-time checked, disposal
+  # is automatic, and overriding a repository in a test is one line.
+  # Pinned to the newest releases that support this toolchain's Dart 3.11.
+  # Riverpod 3.4 / riverpod_lint 3.1.6+ require Dart 3.12; raise these together
+  # with the Flutter SDK, not separately.
+  flutter_riverpod: ^3.0.0
+  riverpod_annotation: ^4.0.0
+
+  # HTTP. Dio over http for interceptors — the token refresh, the retry policy
+  # and the error mapping are cross-cutting and belong in one place, not in
+  # every call site.
+  dio: ^5.11.0
+
+  # Routing. Declarative, so the auth redirect is a rule rather than a
+  # scattering of imperative pushes, and deep links work by construction.
+  go_router: ^17.4.0
+
+  # Models. Freezed for immutability, unions and value equality;
+  # json_serializable for the wire format.
+  freezed_annotation: ^3.0.0
+  json_annotation: ^4.11.0
+
+  # Storage. Tokens go in the Keychain/Keystore; cached responses go in Hive,
+  # which is fast enough to read on the main isolate during a cold start.
+  flutter_secure_storage: ^11.0.0
+  hive_ce: ^2.19.3
+  hive_ce_flutter: ^2.3.4
+
+  connectivity_plus: ^7.3.1
+  cached_network_image: ^3.4.1
+  intl: ^0.20.3
+
+  # An injectable now(). `HoldCountdown` reads the wall clock every second
+  # and its whole job is arithmetic on it — with `DateTime.now()` hardcoded
+  # the countdown logic cannot be tested at all, because a widget test's
+  # fake clock advances timers and not the calendar.
+  clock: ^1.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  build_runner: ^2.4.0
+  freezed: ^3.0.0
+  json_serializable: ^6.8.0
+  riverpod_generator: ^4.0.0
+  # riverpod_lint / custom_lint are deliberately absent: custom_lint pins an
+  # analyzer that build_runner 2.16 and json_serializable 6.14 have both moved
+  # past, and no combination resolves on this SDK. They add lints, not
+  # correctness — `flutter analyze` still runs clean. Add them back when the
+  # analyzer constraints converge.
+  flutter_lints: ^6.0.0
+  mocktail: ^1.0.5
+
+flutter:
+  uses-material-design: true

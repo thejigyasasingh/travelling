@@ -1,0 +1,328 @@
+# Backend CI.
+#
+# Two properties this pipeline is built around:
+#
+# 1. **Fast feedback first.** Lint, types and architecture contracts run in one
+#    job that needs no services and finishes in under a minute. Unit tests run
+#    beside it. Integration tests — the slow ones — only start once those pass,
+#    so a missing import does not cost five minutes of container startup.
+#
+# 2. **CI runs what a developer runs.** Every step is a `make` target. When
+#    something passes locally and fails here, the difference is the environment,
+#    never the command.
+
+name: backend-ci
+
+on:
+  push:
+    branches: [main, develop]
+    # Both spellings, because the repository root has not been fixed yet:
+    # `.github/` currently sits inside `roaming-wandering/`, which makes that
+    # the root and `backend/**` the correct filter — but the tree also reads
+    # as though `roaming-wandering/` might itself be a subdirectory. Path
+    # filters are OR'd, so listing both is correct under either layout and
+    # costs nothing. A filter that matches nothing means CI silently never
+    # runs, which is worse than a redundant line.
+    paths:
+      - "backend/**"
+      - "roaming-wandering/backend/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "roaming-wandering/backend/**"
+      - ".github/workflows/backend-ci.yml"
+  # Callable from `release.yml`, so a tagged release runs the same suite rather
+  # than trusting that main was green when it was tagged.
+  workflow_call:
+
+concurrency:
+  # A new push makes the in-flight run obsolete. Cancelling it frees runners
+  # and stops a stale red X from landing after a green one.
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  WORKDIR: backend
+
+defaults:
+  run:
+    # `backend`, not `roaming-wandering/backend`. GitHub only discovers
+    # workflows at `<repository root>/.github/workflows`, and this file lives at
+    # `roaming-wandering/.github/workflows` — so `roaming-wandering/` *is* the
+    # root whenever this workflow runs at all, and `backend/` is directly under
+    # it. The other spelling names a directory that cannot exist, and the job
+    # would fail on the first step with "working directory does not exist".
+    #
+    # The `paths:` filters above still list both spellings: an over-broad filter
+    # costs a redundant run, whereas a wrong working directory costs every run.
+    working-directory: backend
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  static:
+    name: lint · types · architecture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.WORKDIR }}/pyproject.toml"
+
+      - name: Install
+        run: |
+          uv venv .venv
+          VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+
+      - name: Lint
+        run: make lint
+
+      - name: Typecheck
+        run: make types
+
+      - name: Architecture contracts
+        # The dependency rule and domain purity. Convention decays; a failing
+        # build does not.
+        run: make arch
+
+  # ══════════════════════════════════════════════════════════════════════
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.WORKDIR }}/pyproject.toml"
+
+      - name: Install
+        run: |
+          uv venv .venv
+          VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+
+      - name: Generate test keys
+        run: make keys
+
+      - name: Run
+        # `--cov-fail-under=0` overrides the `fail_under = 70` in pyproject,
+        # for this job only. Unit tests alone reach about 45% — most of this
+        # codebase's behaviour lives in routers and repositories that only the
+        # integration suite executes — so gating here would either fail every
+        # build or force the real threshold down to a number that means
+        # nothing. The `coverage` job below gates the union, which is the only
+        # figure worth gating.
+        run: .venv/bin/pytest -m unit -q --cov --cov-report= --cov-fail-under=0
+
+      - name: Stash coverage data
+        run: mv .coverage coverage-data-unit
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-data-unit
+          path: ${{ env.WORKDIR }}/coverage-data-unit
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  # ══════════════════════════════════════════════════════════════════════
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [static, unit]
+
+    # Service containers rather than testcontainers-in-CI. `conftest.py` prefers
+    # `TEST_DATABASE_DSN`/`TEST_REDIS_URL` when they are set and only falls back
+    # to starting its own containers, so this both runs faster — the services
+    # boot in parallel with checkout and install instead of serially inside the
+    # first test — and exercises the same code path a developer uses against a
+    # local database. The fallback is not thereby untested: it is what runs on
+    # every machine that has Docker and no env vars set.
+    services:
+      postgres:
+        # PostGIS, not stock Postgres. Property search uses `geography` and
+        # `ST_Distance`; against stock Postgres those queries fail to plan and
+        # the tests that matter most never run.
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: rw
+          POSTGRES_PASSWORD: rw
+          POSTGRES_DB: rw_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rw -d rw_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_DSN: postgresql+asyncpg://rw:rw@localhost:5432/rw_test
+      TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.WORKDIR }}/pyproject.toml"
+
+      - name: Install
+        run: |
+          uv venv .venv
+          VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+
+      - name: Generate test keys
+        run: make keys
+
+      - name: Run
+        # Real Postgres, real Redis, real migrations, real middleware — see the
+        # docstring in tests/api/conftest.py for why neither SQLite nor a mock
+        # is acceptable here. Every serious bug found in this codebase so far
+        # lived in code only this suite executes.
+        run: .venv/bin/pytest -m integration -q --cov --cov-report= --cov-fail-under=0
+
+      - name: Stash coverage data
+        run: mv .coverage coverage-data-integration
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-data-integration
+          path: ${{ env.WORKDIR }}/coverage-data-integration
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  # ══════════════════════════════════════════════════════════════════════
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [unit, integration]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.WORKDIR }}/pyproject.toml"
+
+      - name: Install
+        run: |
+          uv venv .venv
+          VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          path: ${{ env.WORKDIR }}/coverage-parts
+          merge-multiple: true
+
+      - name: Combine
+        # `relative_files = true` in pyproject is what makes this work: without
+        # it the two runners record absolute paths and the same file merges as
+        # two separate entries, each showing half its real coverage.
+        run: .venv/bin/coverage combine coverage-parts/coverage-data-*
+
+      - name: Report
+        # The `fail_under = 70` in pyproject applies here, and only here — this
+        # is the one place that sees both suites at once. A regression that
+        # deletes tests fails the build; the number itself is in the log.
+        run: |
+          .venv/bin/coverage report
+          .venv/bin/coverage xml
+          {
+            echo '### Backend coverage'
+            echo
+            echo '```'
+            .venv/bin/coverage report --format=total | xargs -I{} echo 'Total: {}%'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: ${{ env.WORKDIR }}/coverage.xml
+          if-no-files-found: ignore
+
+  # ══════════════════════════════════════════════════════════════════════
+  security:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv .venv
+          VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+
+      - name: Known vulnerabilities
+        # Non-blocking on PRs so a fresh CVE in a transitive dependency does not
+        # stop an unrelated fix from shipping; it still fails on main, where
+        # someone owns acting on it.
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: make audit
+
+  # ══════════════════════════════════════════════════════════════════════
+  docker:
+    name: image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [static]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}
+          file: ${{ env.WORKDIR }}/docker/Dockerfile
+          push: false
+          load: true
+          tags: roaming-wandering-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        # Proves the runtime stage is actually complete — a missing shared
+        # library, an unresolvable import or a broken entrypoint fails here
+        # rather than in a deploy.
+        #
+        # `app.main` builds the app at import, so it needs real configuration;
+        # placeholders are enough to prove the wiring resolves, because nothing
+        # connects until the lifespan runs.
+        run: |
+          docker run --rm \
+            -e APP_ENV=local \
+            -e DATABASE__DSN='postgresql+asyncpg://u:p@localhost:5432/db' \
+            -e REDIS__URL='redis://localhost:6379' \
+            roaming-wandering-backend:ci \
+            python -c "from app.interface.api.app import create_app; create_app(); print('import ok')"
+
+          docker run --rm roaming-wandering-backend:ci alembic --help > /dev/null
+          echo "alembic ok"

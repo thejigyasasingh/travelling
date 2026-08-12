@@ -1,0 +1,247 @@
+[project]
+name = "roaming-wandering-backend"
+version = "0.1.0"
+description = "Roaming & Wandering — travel booking platform backend"
+requires-python = ">=3.13,<3.14"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # ── web ──────────────────────────────────────────────────────────────
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "gunicorn>=23.0.0",
+    "python-multipart>=0.0.12",
+    # ── config / validation ──────────────────────────────────────────────
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "email-validator>=2.2.0",
+    # ── database ─────────────────────────────────────────────────────────
+    "sqlalchemy[asyncio]>=2.0.36",
+    "alembic>=1.14.0",
+    "asyncpg>=0.30.0",
+    "psycopg[binary]>=3.2.0",      # sync driver, used by Alembic only
+    # [shapely] is not optional in practice. Without it geoalchemy2's
+    # `to_shape` raises ImportError, every property's coordinates decode to
+    # None, and no listing can be published because the publish checklist
+    # requires a map location. Nothing else fails loudly enough to notice —
+    # map search runs through raw PostGIS and keeps working.
+    "geoalchemy2[shapely]>=0.15.2",
+    # ── cache / queue ────────────────────────────────────────────────────
+    "redis[hiredis]>=5.2.0",
+    "celery[redis]>=5.4.0",
+    # ── security ─────────────────────────────────────────────────────────
+    "pyjwt[crypto]>=2.9.0",
+    "argon2-cffi>=23.1.0",
+    # ── object storage ───────────────────────────────────────────────────
+    "boto3>=1.35.0",               # S3 presigning; sync client, called via to_thread
+    # ── email ────────────────────────────────────────────────────────────
+    # SMTP over asyncio. SMTP rather than a provider SDK so that switching
+    # between SES, Postmark and a local Mailpit is an environment change
+    # rather than a code change — see notification/infrastructure/smtp.py.
+    "aiosmtplib>=4.0,<5",
+    # ── observability ────────────────────────────────────────────────────
+    "structlog>=24.4.0",
+    "prometheus-client>=0.21.0",
+    # ── misc ─────────────────────────────────────────────────────────────
+    "uuid-utils>=0.10.0",          # UUIDv7 — see docs/adr/0003-uuidv7-primary-keys.md
+    "orjson>=3.10.0",
+    "httpx>=0.27.0",
+    "tenacity>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-env>=1.1.5",
+    "testcontainers[postgres,redis]>=4.8.0",
+    "asgi-lifespan>=2.1.0",        # runs the lifespan under ASGITransport
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+    "import-linter>=2.1",
+    # No types-redis: redis-py 5+ ships inline types (py.typed), and the stub
+    # package is frozen at 4.6 — it contradicts the real library (it has no
+    # `aclose`, for one) and makes mypy report errors that do not exist.
+    "boto3-stubs[s3]>=1.35.0",
+    "pip-audit>=2.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+# ─────────────────────────────────────────────────────────────────────────
+# Ruff — lint + format. Replaces black/isort/flake8/bandit-lite.
+# ─────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "DTZ",       # flake8-datetimez — bans naive datetime (P2 in the design doc)
+    "T20",       # no print()
+    "SIM",       # simplify
+    "RUF",
+    "ASYNC",     # async antipatterns
+    "S",         # bandit
+]
+ignore = [
+    "S101",      # assert — allowed, we use it for invariants
+    "B008",      # function call in default arg — this is how FastAPI Depends works
+]
+# TC/TCH (move imports into `if TYPE_CHECKING`) is deliberately NOT enabled.
+# FastAPI and pydantic evaluate annotations at runtime — dependency injection,
+# response models and Settings validation all resolve the real class. An import
+# hidden behind TYPE_CHECKING typechecks fine and then raises NameError on the
+# first request, which is the worst possible place to find out.
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S311"]
+"alembic/versions/*" = ["E501", "N999"]
+# S608 (SQL built from an f-string). These two modules are the only place in
+# the codebase that composes SQL text, and they do it from a fixed set of
+# literal fragments — WHERE clauses appended by `_build_filters`, ORDER BY and
+# cursor predicates selected from module-level dicts keyed by an enum. Every
+# *value* is a bound parameter; no request string reaches the statement. The
+# suppression is per-file rather than inline because the diagnostic points at
+# the opening line of a multi-line f-string, where a trailing `# noqa` would
+# end up inside the SQL itself.
+"src/app/modules/property/infrastructure/search_repository.py" = ["S608"]
+"src/app/modules/property/infrastructure/repositories.py" = ["S608"]
+# Same reasoning for the admin read models: they compose a WHERE from a fixed
+# list of literal fragments (`_filters`) and interpolate one module-level
+# constant, `EARNING_STATUSES`. Every value the caller supplies — the search
+# box included — is a bound parameter.
+"src/app/modules/admin/infrastructure/queries.py" = ["S608"]
+# And the vendor reports, which interpolate one module-level constant
+# (`EARNED`) into otherwise-literal SQL. Every caller value — the vendor id
+# above all — is a bound parameter.
+"src/app/modules/vendor/infrastructure/queries.py" = ["S608"]
+# And AI retrieval, which interpolates two module-level constants — the booked
+# and stayed status tuples, and the shared column list. Every caller value,
+# including the city name that reaches `popular_in` from a chat message, is a
+# bound parameter.
+"src/app/modules/ai/infrastructure/candidates.py" = ["S608"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+# ─────────────────────────────────────────────────────────────────────────
+# mypy — strict. The domain layer must typecheck cleanly or it isn't domain.
+# ─────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["app"]
+
+[[tool.mypy.overrides]]
+module = ["geoalchemy2.*", "uuid_utils.*", "celery.*", "asgi_lifespan.*", "testcontainers.*"]
+ignore_missing_imports = true
+
+# Celery is untyped: `Task` is Any, and every signal/task decorator is
+# untyped, so strict mode rejects the entire module on the library's account
+# rather than ours. Relaxed only for the queue adapter — the task *bodies*
+# delegate to typed use cases, which are still checked strictly.
+[[tool.mypy.overrides]]
+module = ["app.infrastructure.queue.*", "app.modules.*.infrastructure.tasks"]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+
+# gunicorn's config module is a set of module-level names read by reflection,
+# and prometheus_client's multiprocess helpers are untyped.
+[[tool.mypy.overrides]]
+module = ["app.interface.api.gunicorn_conf"]
+disallow_untyped_calls = false
+
+# Tests exercise dynamic fixtures and deliberately malformed inputs; strict
+# mode there produces noise, not safety. The gate that matters is on src/.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "unit: no I/O, milliseconds",
+    "integration: needs postgres/redis containers",
+    "e2e: full API flows",
+]
+env = [
+    "APP_ENV=test",
+    "SECURITY__JWT_PRIVATE_KEY_PATH=tests/fixtures/keys/test_jwt_private.pem",
+]
+
+[tool.coverage.run]
+source = ["src/app"]
+branch = true
+# CI measures unit and integration in separate jobs and combines the data files
+# afterwards. `parallel` gives each run a distinct suffix so they do not
+# overwrite one another, and `relative_files` records paths relative to this
+# directory so files measured on two different runners still merge into one
+# entry rather than two half-covered ones.
+#
+# Both are harmless locally: a single `pytest --cov` run writes one data file
+# and reports the same numbers either way.
+parallel = true
+relative_files = true
+omit = [
+    "*/alembic/*",
+    "*/__main__.py",
+    # Process entrypoints. Executed by gunicorn, celery and the shell rather
+    # than by anything a test can call, and a test that imported them would be
+    # asserting that Python can import a module.
+    "*/main.py",
+    "*/gunicorn_conf.py",
+    "*/interface/cli/*",
+    "*/queue/celery_app.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    # Protocol bodies. `...` is the definition, not logic.
+    "^\\s*\\.\\.\\.$",
+    "@(abc\\.)?abstractmethod",
+]
+show_missing = true
+skip_covered = true
+
+# 75%, raised from 70 once the suite actually held it.
+#
+# A gate is only useful if it is true — one set above what the suite reaches
+# gets `--no-cov` added to the CI command within a month, and then nothing is
+# measured at all. So it sits just under the current figure and ratchets:
+# 70 when the API suite landed at 75%, 75 now the money path and the
+# notification module have taken it to 77%.
+#
+# Two points of headroom, not zero. A gate with no slack fails on an unrelated
+# refactor that deletes ten covered lines, and a gate that fails for reasons
+# nobody caused is a gate that gets lowered.
+#
+# What is *not* covered is as deliberate as what is: Celery's sync task
+# wrappers bridge into async and cannot run in a test process, the Google OAuth
+# client needs Google, and the vision model needs an image and an API key.
+# Those are integration surfaces, and pretending otherwise with a mock would
+# report coverage of the mock.
+fail_under = 75

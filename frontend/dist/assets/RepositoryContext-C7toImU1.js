@@ -1,0 +1,2 @@
+import{n as e}from"./rolldown-runtime-CbXtAM7H.js";import{l as t,o as n}from"./query-Bvhksuxa.js";var r=e(t(),1),i=n(),a=(0,r.createContext)(null);function o({repositories:e,children:t}){return(0,i.jsx)(a,{value:e,children:t})}function s(){let e=(0,r.use)(a);if(!e)throw Error(`useRepositories must be used inside <RepositoryProvider>`);return e}export{s as n,o as t};
+//# sourceMappingURL=RepositoryContext-C7toImU1.js.map

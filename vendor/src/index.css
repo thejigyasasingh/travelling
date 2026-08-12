@@ -1,0 +1,65 @@
+@import 'tailwindcss';
+
+/**
+ * Admin tokens.
+ *
+ * A denser, cooler palette than the customer site, deliberately: this is a tool
+ * people use for hours, and it should never be mistaken for the public product
+ * in a screenshot. Slate rather than warm neutrals, tighter spacing, more
+ * information per screen.
+ */
+@theme {
+  --color-brand-50: oklch(0.97 0.02 250);
+  --color-brand-100: oklch(0.93 0.04 250);
+  --color-brand-500: oklch(0.58 0.16 255);
+  --color-brand-600: oklch(0.51 0.17 256);
+  --color-brand-700: oklch(0.44 0.15 257);
+
+  --color-ink-50: oklch(0.98 0.003 250);
+  --color-ink-100: oklch(0.96 0.004 250);
+  --color-ink-200: oklch(0.91 0.006 250);
+  --color-ink-300: oklch(0.83 0.008 250);
+  --color-ink-400: oklch(0.66 0.012 250);
+  --color-ink-500: oklch(0.54 0.014 250);
+  --color-ink-600: oklch(0.44 0.016 250);
+  --color-ink-700: oklch(0.35 0.016 250);
+  --color-ink-800: oklch(0.26 0.014 250);
+  --color-ink-900: oklch(0.17 0.012 250);
+
+  --color-good-50: oklch(0.96 0.03 155);
+  --color-good-600: oklch(0.53 0.13 155);
+  --color-good-700: oklch(0.44 0.11 155);
+  --color-warn-50: oklch(0.97 0.04 85);
+  --color-warn-600: oklch(0.6 0.13 70);
+  --color-warn-700: oklch(0.5 0.12 68);
+  --color-bad-50: oklch(0.96 0.02 25);
+  --color-bad-600: oklch(0.54 0.19 25);
+  --color-bad-700: oklch(0.46 0.17 25);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-ink-50 text-ink-800 font-sans antialiased;
+  }
+
+  /* Never removed. A keyboard user with no focus ring cannot use a table of
+     twenty row actions at all. */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand-600;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  /* Numbers in a column must line up, or comparing them is guesswork. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}

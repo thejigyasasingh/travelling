@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: roaming-wandering
+    orgId: 1
+    folder: 'Roaming & Wandering'
+    type: file
+    # Editable in the UI, but the file wins on restart. Dashboards belong in
+    # git; a dashboard someone tuned during an incident and never saved is a
+    # dashboard that does not exist.
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

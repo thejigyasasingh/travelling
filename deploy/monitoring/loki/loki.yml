@@ -1,0 +1,67 @@
+# Single-binary Loki. Filesystem storage, no object store, no clustering.
+#
+# Right for one host: Loki's distributed mode exists for multi-tenant scale and
+# brings a ring, a consistent hash and four more processes to operate. This
+# holds a month of logs for one product on local disk.
+
+auth_enabled: false      # single tenant; the network is the boundary
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # Log queries are chatty and Loki logs each one at info. Warn keeps its own
+  # output from being most of what it stores.
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Rejecting old lines protects against a clock-skewed container replaying a
+  # week of history and flooding the index.
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # Application logs are structured JSON with a request id — the labels are
+  # already enough. Volume caps are a backstop against a crash loop writing
+  # gigabytes a minute.
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  max_query_series: 5000
+  # A range query longer than this is almost always a mistake in the query
+  # rather than an intention.
+  max_query_length: 721h
+  allow_structured_metadata: true
+  volume_enabled: true
+  # Thirty days. Enforced by the compactor below — without `retention_enabled`
+  # there this line does nothing and the disk fills quietly.
+  retention_period: 720h
+
+compactor:
+  working_directory: /loki/compactor
+  # Retention only happens if the compactor is told to do it. Without these
+  # three lines the `retention_period` below is decorative and the disk fills.
+  retention_enabled: true
+  delete_request_store: filesystem
+  compaction_interval: 10m
+
+analytics:
+  reporting_enabled: false

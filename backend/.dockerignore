@@ -1,0 +1,38 @@
+# Everything not needed to build. Two reasons this is aggressive:
+#
+#   1. Build context size. Sending .venv/ and .git/ to the daemon adds seconds
+#      to every build and invalidates the cache on every branch switch.
+#   2. Secrets. A .env or a .pem copied into a layer stays in the image
+#      history even if a later layer deletes it.
+
+.git/
+.github/
+.gitignore
+
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+tests/
+docs/
+*.md
+!README.md
+
+docker-compose*.yml
+Makefile
+.DS_Store

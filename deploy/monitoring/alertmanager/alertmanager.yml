@@ -1,0 +1,77 @@
+# Where alerts go, and how hard they try to reach someone.
+#
+# Two channels and one rule for choosing: `page: "true"` wakes a human,
+# everything else goes to Slack and waits until morning. That label is set
+# deliberately per alert rather than derived from severity, because "critical"
+# drifts — every alert becomes critical eventually if nobody is paying the
+# cost of being woken by it.
+
+global:
+  resolve_timeout: 5m
+  slack_api_url: '${SLACK_WEBHOOK_URL}'
+
+route:
+  # Group by alertname *and* service. Without the service, a disk alert on the
+  # host and one in a container collapse into a single notification and the
+  # second is silently swallowed.
+  group_by: [alertname, service]
+  # Thirty seconds before the first notification: long enough that a burst of
+  # related alerts arrives as one message, short enough not to delay a page.
+  group_wait: 30s
+  group_interval: 5m
+  # Four hours before re-notifying about something still firing. Shorter and
+  # an unresolved incident becomes a stream of duplicates people mute.
+  repeat_interval: 4h
+  receiver: slack
+
+  routes:
+    - matchers: [page="true"]
+      receiver: pagerduty
+      group_wait: 10s        # a page should not wait thirty seconds
+      repeat_interval: 1h
+      # Also to Slack, so the team sees what the on-call person is dealing
+      # with rather than finding out afterwards.
+      continue: true
+
+    - matchers: [page="true"]
+      receiver: slack
+
+inhibit_rules:
+  # If the API is down, its error rate and latency alerts are consequences.
+  # Sending all three turns one incident into three notifications and makes
+  # the actual cause harder to see.
+  - source_matchers: [alertname="APIDown"]
+    target_matchers: [severity=~"warning|critical"]
+    equal: [service]
+
+  # Postgres being down explains almost everything else.
+  - source_matchers: [alertname="PostgresDown"]
+    target_matchers: [alertname=~"HighErrorRate|SlowRequests|CheckoutFailing|ConnectionPoolNearlyFull"]
+
+  # A full disk explains the database problems that follow it.
+  - source_matchers: [alertname="DiskCritical"]
+    target_matchers: [alertname=~"DiskFillingUp|PostgresDown|BackupMissing"]
+
+receivers:
+  - name: slack
+    slack_configs:
+      - channel: '#alerts'
+        send_resolved: true
+        title: '{{ if eq .Status "firing" }}🔴{{ else }}✅{{ end }} {{ .CommonLabels.alertname }}'
+        # The description carries the user-visible consequence; the runbook
+        # carries the first command to run. Both in the message, because the
+        # person reading it on a phone will not click through to find them.
+        text: >-
+          {{ range .Alerts }}*{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          {{ if .Annotations.runbook }}`{{ .Annotations.runbook }}`{{ end }}
+          {{ end }}
+
+  - name: pagerduty
+    pagerduty_configs:
+      - routing_key: '${PAGERDUTY_ROUTING_KEY}'
+        send_resolved: true
+        description: '{{ .CommonLabels.alertname }}: {{ .CommonAnnotations.summary }}'
+        details:
+          consequence: '{{ .CommonAnnotations.description }}'
+          runbook: '{{ .CommonAnnotations.runbook }}'

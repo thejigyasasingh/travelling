@@ -1,0 +1,557 @@
+; Architecture enforcement. See ../docs/adr/0001-modular-monolith.md for why
+; this is a modular monolith rather than a set of services, and what the
+; exit looks like if that ever stops being true.
+;
+; These contracts are the difference between "we agreed on layering" and
+; "we have layering". Convention decays; a failing build does not.
+
+[importlinter]
+root_packages =
+    app
+include_external_packages = True
+
+; ─────────────────────────────────────────────────────────────────────────
+; 1. The dependency rule. Inner layers must not know about outer ones.
+; ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:layers]
+name = Clean architecture layers
+type = layers
+; Layer names are relative to the container, so `interface` means
+; `app.interface`. `app.core` is deliberately absent: it holds framework-free
+; primitives (config, errors, clock, Money) that every layer may import, and
+; putting it in the stack would force an artificial ordering on things that
+; have no dependencies of their own. `app.container` is likewise outside —
+; it is the composition root and exists precisely to know about everything.
+layers =
+    interface
+    infrastructure
+    shared.application
+    shared.domain
+containers =
+    app
+
+; ─────────────────────────────────────────────────────────────────────────
+; 2. The domain layer is pure Python. No frameworks, no I/O, no clock.
+;    This is what makes pricing/refund/availability testable in milliseconds.
+; ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:domain-purity]
+name = Domain layer imports no framework
+type = forbidden
+source_modules =
+    app.shared.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+
+; ─────────────────────────────────────────────────────────────────────────
+; 3. The same dependency rule applies INSIDE each module. Without this, a
+;    module keeps the layering at its edges and rots internally — the
+;    repository imports the router for a schema, the domain imports the ORM
+;    model "just for a type", and the module stops being extractable.
+;
+;    Add a block per module as it lands.
+; ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:auth-layers]
+name = Auth module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.auth
+
+; The auth domain is subject to the same purity rule as app.shared.domain:
+; lockout, rotation and RBAC must stay testable in milliseconds with no
+; framework, no I/O and no clock it does not own.
+[importlinter:contract:auth-domain-purity]
+name = Auth domain imports no framework
+type = forbidden
+source_modules =
+    app.modules.auth.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+    jwt
+    argon2
+
+[importlinter:contract:property-layers]
+name = Property module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.property
+
+; Pricing, availability and the publication rules must stay testable in
+; milliseconds with no database and no framework.
+[importlinter:contract:property-domain-purity]
+name = Property domain imports no framework
+type = forbidden
+source_modules =
+    app.modules.property.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+    geoalchemy2
+    boto3
+
+; Modules talk through events and the shared kernel, never directly to each
+; other's internals. The one permitted exception is auth's RBAC catalogue,
+; which every module's routes need in order to declare their permissions.
+[importlinter:contract:property-module-isolation]
+name = Property does not reach into other modules
+type = forbidden
+source_modules =
+    app.modules.property.domain
+    app.modules.property.application
+    app.modules.property.infrastructure
+forbidden_modules =
+    app.modules.auth
+
+[importlinter:contract:booking-layers]
+name = Booking module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.booking
+
+; The refund engine, the status machine and the money invariants must stay
+; testable in milliseconds with no database and no framework.
+[importlinter:contract:booking-domain-purity]
+name = Booking domain imports no framework
+type = forbidden
+source_modules =
+    app.modules.booking.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+
+; ─────────────────────────────────────────────────────────────────────────
+; THE module boundary that matters most.
+;
+; Booking needs property data and inventory, so it would be trivially easy for
+; it to import `property.domain.entities` and depend on the shape of that
+; aggregate. Then the property module could no longer change its internals, and
+; extracting either into its own service would be a rewrite.
+;
+; So booking may import `app.modules.property.public` — a published contract of
+; flat read models and protocols — and nothing else inside property. This
+; contract is what makes that a rule rather than an intention.
+; ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:booking-uses-property-contract-only]
+name = Booking reaches property only through its published contract
+type = forbidden
+source_modules =
+    app.modules.booking
+forbidden_modules =
+    app.modules.property.infrastructure
+    app.modules.property.interface
+    app.modules.property.application
+; The contract's purpose is that booking must not depend on property's
+; *internals*. The adapters behind `property.public` necessarily use property's
+; own tables — that is what an adapter is, and the edge lives entirely inside
+; the property module. Ignoring it keeps the contract about the boundary that
+; matters instead of failing on the module implementing its own contract.
+;
+; Note what is NOT ignored: any direct booking -> property.infrastructure
+; import still breaks the build.
+ignore_imports =
+    app.modules.property.public.adapters -> app.modules.property.infrastructure.models
+    app.modules.property.public.contract -> app.modules.property.domain.pricing
+    app.modules.property.public.adapters -> app.modules.property.domain.pricing
+
+; Booking's own domain additionally must not know property's domain at all —
+; the snapshots in the contract are what it works with.
+[importlinter:contract:booking-domain-isolation]
+name = Booking domain does not import other modules
+type = forbidden
+source_modules =
+    app.modules.booking.domain
+forbidden_modules =
+    app.modules.property
+    app.modules.auth
+
+; ─────────────────────────────────────────────────────────────────────────
+; 6. Event consumers depend on nobody. They subscribe, they don't call.
+;    (Populated as modules land. The event flow is described in
+;     ../docs/adr/0005-transactional-outbox.md.)
+; ─────────────────────────────────────────────────────────────────────────
+; `search` and `media` do not exist yet — import-linter errors on a contract
+; naming a module that is not in the graph, so they stay commented until they
+; land. `notification` is real now and is listed.
+;
+; The independence that matters here is inbound: notification learns what to
+; send from the event payload alone. It never imports auth to look a user up,
+; which is what keeps "send the verification mail" from becoming a second
+; source of truth about who a user is — and what lets the worker run with no
+; knowledge of any module that publishes to it.
+[importlinter:contract:event-consumers]
+name = Event consumers are independent
+type = independence
+modules =
+    app.modules.notification
+;     app.modules.search
+;     app.modules.media
+
+[importlinter:contract:payment-layers]
+name = Payment module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.payment
+
+; Signature verification, the status machine and the money invariants must stay
+; testable in milliseconds with no database, no network and no framework. The
+; signature module in particular is pure `hmac` and `hashlib` on purpose: it is
+; the security boundary of the whole module, and it must be readable and
+; testable without a gateway anywhere in sight.
+[importlinter:contract:payment-domain-purity]
+name = Payment domain imports no framework
+type = forbidden
+source_modules =
+    app.modules.payment.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+    razorpay
+
+; ─────────────────────────────────────────────────────────────────────────
+; The payment -> booking boundary.
+;
+; Payment must confirm bookings and record refund outcomes, so it would be
+; trivially easy for it to import booking's aggregate and drive the status
+; machine itself. Then confirmation logic would exist in two places and drift,
+; and the invoice number would be minted by whichever module got there first.
+;
+; So payment may import `app.modules.booking.public` and nothing else inside
+; booking. The adapter behind that contract calls booking's own use cases, so
+; invoice numbering, event emission and the hold re-check all still run.
+;
+; The dependency is one-way: booking never imports payment. It emits
+; `booking.refund.requested` and lets payment execute the gateway call.
+; ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:payment-uses-booking-contract-only]
+name = Payment reaches booking only through its published contract
+type = forbidden
+source_modules =
+    app.modules.payment
+forbidden_modules =
+    app.modules.booking.infrastructure
+    app.modules.booking.interface
+    app.modules.booking.domain
+; As with property's contract: the adapter implementing booking's own contract
+; necessarily uses booking's internals. That edge lives entirely inside the
+; booking module. A direct payment -> booking.infrastructure import still
+; breaks the build.
+ignore_imports =
+    app.modules.booking.public.adapters -> app.modules.booking.infrastructure.repositories
+    app.modules.booking.public.adapters -> app.modules.booking.domain.value_objects
+    app.modules.booking.public.adapters -> app.modules.booking.application.use_cases.lifecycle
+
+; Payment's domain must not know booking or property at all — the snapshots in
+; the contract are what it works with.
+[importlinter:contract:payment-domain-isolation]
+name = Payment domain does not import other modules
+type = forbidden
+source_modules =
+    app.modules.payment.domain
+forbidden_modules =
+    app.modules.booking
+    app.modules.property
+    app.modules.auth
+
+# ─────────────────────────────────────────────────────────────────────────
+# Phase 11 modules.
+# ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:vendor-layers]
+name = Vendor module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.vendor
+
+[importlinter:contract:coupon-layers]
+name = Coupon module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.coupon
+
+[importlinter:contract:support-layers]
+name = Support module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.support
+
+; The discount arithmetic, the approval gate and the SLA rules must stay
+; testable in milliseconds with no database and no framework.
+[importlinter:contract:new-domains-are-pure]
+name = Vendor, coupon and support domains import no framework
+type = forbidden
+source_modules =
+    app.modules.vendor.domain
+    app.modules.coupon.domain
+    app.modules.support.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+
+; These three know nothing about each other, or about anything else. A coupon
+; does not need to know what a ticket is, and a support ticket that imported
+; the booking aggregate would make the support desk a reason booking cannot
+; change.
+[importlinter:contract:new-modules-are-independent]
+name = Vendor, coupon and support are independent
+type = independence
+modules =
+    app.modules.vendor
+    app.modules.coupon
+    app.modules.support
+
+; ─────────────────────────────────────────────────────────────────────────
+; The admin module is the exception that proves the rule.
+;
+; It reads across every module — a user row joins bookings and payments — which
+; is why its queries are raw SQL against a read replica rather than calls into
+; four repositories. What it must NOT do is *write* to another module's tables:
+; every admin action goes through the owning module's use case so that module's
+; invariants, events and audit trail still run.
+;
+; That rule cannot be expressed as an import contract, so it is enforced by the
+; layering below (admin has no repositories of its own) plus review.
+; ─────────────────────────────────────────────────────────────────────────
+[importlinter:contract:admin-layers]
+name = Admin module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+containers =
+    app.modules.admin
+
+[importlinter:contract:admin-owns-no-domain]
+name = Admin defines no domain of its own
+type = forbidden
+source_modules =
+    app.modules.admin.application
+    app.modules.admin.infrastructure
+forbidden_modules =
+    app.modules.booking.domain
+    app.modules.payment.domain
+    app.modules.property.domain
+    app.modules.coupon.domain
+    app.modules.support.domain
+
+[importlinter:contract:review-layers]
+name = Review module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.review
+
+; The rating arithmetic, the edit window and the moderation rules must stay
+; testable in milliseconds with no database and no framework.
+[importlinter:contract:review-domain-purity]
+name = Review domain imports no framework
+type = forbidden
+source_modules =
+    app.modules.review.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    redis
+    celery
+    httpx
+    pydantic
+    starlette
+
+; Reviews need two things from other modules and reach both through published
+; contracts: the booking that proves the stay happened, and the property whose
+; public rating the review moves. Naming either module's internals would make
+; the review module a reason neither could change.
+[importlinter:contract:review-uses-contracts-only]
+name = Review reaches booking and property only through their contracts
+type = forbidden
+source_modules =
+    app.modules.review
+forbidden_modules =
+    app.modules.booking.infrastructure
+    app.modules.booking.interface
+    app.modules.booking.domain
+    app.modules.property.infrastructure
+    app.modules.property.interface
+    app.modules.property.domain
+ignore_imports =
+    app.modules.booking.public.adapters -> app.modules.booking.infrastructure.repositories
+    app.modules.booking.public.adapters -> app.modules.booking.domain.value_objects
+    app.modules.booking.public.adapters -> app.modules.booking.application.use_cases.lifecycle
+    app.modules.property.public.adapters -> app.modules.property.infrastructure.models
+    app.modules.property.public.contract -> app.modules.property.domain.pricing
+    app.modules.property.public.contract -> app.modules.property.domain.value_objects
+    app.modules.property.public.adapters -> app.modules.property.domain.pricing
+
+; ══════════════════════════════════════════════════════════════════════════
+; AI
+; ══════════════════════════════════════════════════════════════════════════
+
+[importlinter:contract:ai-layers]
+name = AI module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.ai
+
+; The grounding rules and the ranking arithmetic are the two things in this
+; module that must be provable without a network. A domain that can import
+; httpx is a domain where somebody eventually calls a model from inside a
+; scoring function, and the scoring stops being reproducible.
+[importlinter:contract:ai-domain-purity]
+name = AI domain imports no framework and no model
+type = forbidden
+source_modules =
+    app.modules.ai.domain
+forbidden_modules =
+    fastapi
+    sqlalchemy
+    httpx
+    redis
+    celery
+
+; The AI module reads across the platform, but its *reasoning* must not depend
+; on any of it. Scoped to domain and application: those two layers hold the
+; grounding rules, the ranking arithmetic and the use cases, and a cross-module
+; import there is a real design violation — a recommendation use case that can
+; reach the booking module is one that can eventually cancel a booking.
+;
+; Infrastructure and interface are excluded because they are composition: a
+; router imports `app.interface.api.deps`, a task resolves `app.container`, and
+; both of those know about every module by construction. Listing them here
+; would report the composition root as a dependency of this module, which says
+; nothing true about the design.
+[importlinter:contract:ai-reasoning-is-independent]
+name = AI reasoning imports no other module
+type = forbidden
+source_modules =
+    app.modules.ai.domain
+    app.modules.ai.application
+forbidden_modules =
+    app.modules.auth
+    app.modules.booking
+    app.modules.payment
+    app.modules.property
+    app.modules.review
+    app.modules.vendor
+    app.modules.coupon
+    app.modules.support
+    app.modules.admin
+
+; ══════════════════════════════════════════════════════════════════════════
+; Wishlist
+; ══════════════════════════════════════════════════════════════════════════
+
+[importlinter:contract:wishlist-layers]
+name = Wishlist module layers
+type = layers
+layers =
+    interface
+    infrastructure
+    application
+    domain
+containers =
+    app.modules.wishlist
+
+; A wishlist reads the catalogue and nothing else. Reaching into booking or
+; payment from here would be a wishlist that can spend money.
+[importlinter:contract:wishlist-isolated]
+name = Wishlist reaches the catalogue only through its contract
+type = forbidden
+source_modules =
+    app.modules.wishlist.domain
+    app.modules.wishlist.application
+    app.modules.wishlist.infrastructure
+forbidden_modules =
+    app.modules.booking
+    app.modules.payment
+    app.modules.review
+    app.modules.vendor
+    app.modules.coupon
+    app.modules.support
+    app.modules.admin
+    app.modules.ai
+    app.modules.property.domain
+    app.modules.property.application
+    app.modules.property.infrastructure
+    app.modules.property.interface
+ignore_imports =
+    ; The published contract's own internals. Same exemption every consumer of
+    ; `property.public` carries — the boundary is the package, and it is
+    ; allowed to import the module it publishes.
+    app.modules.property.public.contract -> app.modules.property.domain.pricing
+    app.modules.property.public.contract -> app.modules.property.domain.value_objects
+    app.modules.property.public.adapters -> app.modules.property.domain.pricing
+    app.modules.property.public.adapters -> app.modules.property.infrastructure.models

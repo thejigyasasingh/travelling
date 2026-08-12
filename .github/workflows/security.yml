@@ -1,0 +1,182 @@
+# Scheduled security scanning.
+#
+# On a schedule as well as on push, and the schedule is the important half: a
+# dependency that was clean when it merged becomes vulnerable the day a CVE is
+# published, and nothing about the repository changes to trigger a rebuild.
+# Most real exposure arrives this way rather than in a pull request.
+#
+# Nothing here blocks a deploy. The image scan in `release.yml` does that, on
+# the artefact actually being shipped. This job exists to *find* things, and a
+# scanner that blocks merges on findings it cannot fix teaches people to skip
+# it.
+
+name: security
+
+on:
+  schedule:
+    # 03:00 UTC daily — after the overnight CVE feeds publish, before anyone
+    # starts work, so findings are waiting rather than interrupting.
+    - cron: '0 3 * * *'
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # `security-extended` over the default: the extra rules catch the
+          # taint-tracking cases that matter for a payments application —
+          # unsanitised input reaching a query, a redirect, or a subprocess.
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
+
+  # ══════════════════════════════════════════════════════════════════════
+  dependencies:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Filesystem mode rather than image mode: this reads the lockfiles, so it
+      # sees a vulnerable transitive dependency before an image is ever built.
+      - name: Scan lockfiles
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          # Reported, not blocking — see the header. `exit-code: 0` is
+          # deliberate here and deliberately *not* in release.yml.
+          exit-code: '0'
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      # npm's own advisory database overlaps Trivy's but is not identical, and
+      # the JavaScript ecosystem is where the overlap is weakest.
+      - name: npm audit
+        continue-on-error: true
+        run: |
+          for app in frontend admin vendor; do
+            [[ -d "$app" ]] || continue
+            echo "### $app" >> "$GITHUB_STEP_SUMMARY"
+            (cd "$app" && npm audit --audit-level=high 2>&1 | tail -20) \
+              >> "$GITHUB_STEP_SUMMARY" || true
+          done
+
+  # ══════════════════════════════════════════════════════════════════════
+  secrets:
+    name: secret scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history. A key committed and then removed in the next commit
+          # is still in the repository and still needs rotating — scanning only
+          # the tip finds nothing.
+          fetch-depth: 0
+
+      - name: Scan history for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ══════════════════════════════════════════════════════════════════════
+  configuration:
+    name: infrastructure configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dockerfiles and compose files. Catches the mistakes that do not look
+      # like mistakes: a container running as root, a missing USER, a `latest`
+      # tag, a secret in an ENV.
+      - name: Scan Dockerfiles and compose
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-config.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      # The checks a scanner will not make, because they are specific to this
+      # deployment. Each one is a mistake that has shipped somewhere before.
+      - name: Assert the deployment invariants
+        run: |
+          set -Eeuo pipefail
+          fail=0
+          note() { echo "::error::$*"; fail=1; }
+
+          cd deploy 2>/dev/null || exit 0
+
+          # A database on the public internet is the single most damaging
+          # misconfiguration available, and it is one stray `ports:` away.
+          if awk '/^  (postgres|redis):/{s=1} /^  [a-z-]+:$/{if(!/^  (postgres|redis):/) s=0} s&&/^\s+ports:/{print}' \
+               docker-compose.prod.yml | grep -q .; then
+            note "postgres or redis publishes a port — they must stay on the internal network"
+          fi
+
+          # `latest` means a container restarted weeks later comes back as a
+          # different build than the one that was tested.
+          if grep -nE 'image:.*:latest' docker-compose.prod.yml | grep -v certbot | grep -q .; then
+            note "an image is pinned to :latest"
+          fi
+
+          # A real secret committed in the example file is a real secret
+          # committed.
+          if grep -qE '^(POSTGRES_PASSWORD|REDIS_PASSWORD|RAZORPAY_KEY_SECRET|AI_API_KEY)=.+' \
+               env/production.env.example; then
+            note "env/production.env.example contains a filled-in secret"
+          fi
+
+          # Grafana and Prometheus have no authentication worth exposing.
+          if grep -nE '^\s+- "[0-9]+:(3000|9090)"' docker-compose.prod.yml | grep -q .; then
+            note "Grafana or Prometheus is published on all interfaces — bind to 127.0.0.1"
+          fi
+
+          exit $fail

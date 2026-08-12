@@ -1,0 +1,96 @@
+# Shipping container logs to Loki.
+#
+# The rule that governs this file: **labels are for identity, not content.**
+# Every distinct combination of label values is a separate stream and a
+# separate index entry, so labelling by request id or user id turns a log
+# system into an unusable cardinality explosion. Those live in the line, which
+# Loki greps.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  # On a volume, so a Promtail restart resumes rather than re-shipping every
+  # log on disk.
+  filename: /tmp/positions/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    # Buffer through a restart of Loki rather than dropping lines. An incident
+    # is exactly when both are under stress and the logs matter most.
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 20
+
+scrape_configs:
+  # ── every container ───────────────────────────────────────────────────
+  - job_name: containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        regex: '/(.*)'
+        target_label: container
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service
+      - source_labels: [__meta_docker_container_log_stream]
+        target_label: stream
+
+    pipeline_stages:
+      # The application logs structlog JSON. Parsing it here means a query can
+      # filter on level without a regex over the message.
+      - json:
+          expressions:
+            level: level
+            event: event
+            request_id: request_id
+      - labels:
+          # `level` only. Bounded to five values, and it is what every
+          # investigation filters on first.
+          level:
+      # request_id stays *out* of labels and in the line — unbounded
+      # cardinality would be one stream per request.
+      - timestamp:
+          source: time
+          format: RFC3339Nano
+          # A container with a wrong clock must not reorder everyone else's
+          # logs; fall back to ingest time rather than failing the line.
+          action_on_failure: fudge
+
+  # ── nginx access logs ─────────────────────────────────────────────────
+  #
+  # Read from the shared volume rather than stdout: nginx writes access and
+  # error to separate files, and keeping them separate here means an access-log
+  # query is not wading through startup noise.
+  - job_name: nginx
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: nginx
+          service: nginx
+          __path__: /var/log/nginx/*.log
+
+    pipeline_stages:
+      - match:
+          selector: '{job="nginx"}'
+          stages:
+            - json:
+                expressions:
+                  status: status
+                  method: method
+                  path: path
+                  request_time: request_time
+            - labels:
+                # Status *class*, not the code: 5xx is what anyone alerts on,
+                # and 60 distinct codes would be 60 streams.
+                method:
+            - template:
+                source: status_class
+                template: '{{ if ge (atoi .status) 500 }}5xx{{ else if ge (atoi .status) 400 }}4xx{{ else }}ok{{ end }}'
+            - labels:
+                status_class:

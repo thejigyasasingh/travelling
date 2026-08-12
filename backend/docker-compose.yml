@@ -1,0 +1,200 @@
+# Local development stack.
+#
+# Goal: `make up` gives a working backend with no other setup. Every service a
+# developer needs runs here — including MinIO and Mailpit, so nobody has to
+# point their laptop at a shared S3 bucket or send test emails to real people.
+#
+# NOT a production topology. Production is ECS/EKS with RDS, ElastiCache and
+# real S3; this file is convenience, and its credentials are deliberately
+# obvious placeholders so nobody mistakes one for a real secret.
+
+name: roaming-wandering
+
+x-backend-env: &backend-env
+  APP_ENV: local
+  DEBUG: "true"
+  LOG_FORMAT: console
+  LOG_LEVEL: DEBUG
+  DATABASE__DSN: postgresql+asyncpg://rw_app:rw_local_pw@postgres:5432/roaming_wandering
+  DATABASE__REPLICA_DSN: postgresql+asyncpg://rw_app:rw_local_pw@postgres:5432/roaming_wandering
+  REDIS__URL: redis://redis:6379
+  STORAGE__ENDPOINT_URL: http://minio:9000
+  STORAGE__ACCESS_KEY: minioadmin
+  STORAGE__SECRET_KEY: minioadmin
+  STORAGE__BUCKET: rw-media-local
+  SECURITY__JWT_PRIVATE_KEY_PATH: /app/secrets/jwt_private.pem
+  SECURITY__JWT_PUBLIC_KEY_PATH: /app/secrets/jwt_public.pem
+  # Mail goes to Mailpit, on the compose network. Read it at
+  # http://localhost:8025 — nothing leaves the machine.
+  EMAIL__ENABLED: "true"
+  EMAIL__HOST: mailpit
+  EMAIL__PORT: "1025"
+  EMAIL__START_TLS: "false"
+  EMAIL__TLS: "false"
+  EMAIL__FROM_ADDRESS: no-reply@roamingwandering.local
+  # The *customer site*, not the API: a verification link is opened by a person
+  # in a browser, and the API host would show them JSON.
+  EMAIL__WEB_BASE_URL: http://localhost:5173
+
+x-backend-base: &backend-base
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    target: runtime
+  image: roaming-wandering-backend:local
+  environment: *backend-env
+  volumes:
+    # Source is bind-mounted so `--reload` picks up edits without a rebuild.
+    - ./src:/app/src:ro
+    - ./alembic:/app/alembic:ro
+    - ./secrets:/app/secrets:ro
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  restart: unless-stopped
+
+services:
+  # ══════════════════════════════════════════════════════════════════════
+  # Data stores
+  # ══════════════════════════════════════════════════════════════════════
+  postgres:
+    image: postgis/postgis:17-3.5
+    # PostGIS, not plain Postgres: the geo-radius search ("hotels within 5 km")
+    # needs it, and having it locally from day one prevents "works on my
+    # machine" when a migration creates a geography column.
+    environment:
+      POSTGRES_USER: rw_app
+      POSTGRES_PASSWORD: rw_local_pw
+      POSTGRES_DB: roaming_wandering
+      # C collation + UTF8: matches what RDS is provisioned with. A collation
+      # mismatch changes index ordering and makes local query plans lie.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      # Tuned to be *representative*, not fast. A local instance with default
+      # settings produces plans that differ from production's.
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - random_page_cost=1.1 # SSD; the 4.0 default assumes spinning disks
+      - -c
+      - log_min_duration_statement=200 # surface slow queries during development
+      - -c
+      - track_io_timing=on
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rw_app -d roaming_wandering"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      # allkeys-lru: this instance is a cache. In production the cache and the
+      # broker are separate instances, and the broker uses noeviction —
+      # evicting a queued task loses work.
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "no"
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mailpit:
+    # Catches every outbound email. Without it, testing password reset means
+    # either a real inbox or trusting a log line.
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # web UI
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Application
+  # ══════════════════════════════════════════════════════════════════════
+  migrate:
+    <<: *backend-base
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *backend-base
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/src
+      - --log-config
+      - "null"
+      - --no-access-log
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    <<: *backend-base
+    command: ["worker"]
+    environment:
+      <<: *backend-env
+      # One local worker serves every queue. In production each queue gets its
+      # own deployment so that a slow media job cannot delay a booking
+      # confirmation — see celery_app.py.
+      QUEUES: critical,default,media,bulk,scheduled
+      CELERY__WORKER_CONCURRENCY: "2"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  beat:
+    <<: *backend-base
+    command: ["beat"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  postgres-data:
+  minio-data:

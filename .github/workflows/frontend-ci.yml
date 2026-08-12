@@ -1,0 +1,127 @@
+# Lint, typecheck and test the three TypeScript apps.
+#
+# A matrix rather than three copies: they share a toolchain and a config shape,
+# and three near-identical workflow files drift within a month. `fail-fast:
+# false` so one app's failure does not hide the other two — the whole point of
+# running them together is finding out about all three at once.
+
+name: frontend-ci
+
+on:
+  push:
+    branches: [main]
+    # Both spellings — see the note in backend-ci.yml. A path filter that
+    # matches nothing means CI never runs and nobody notices for months.
+    paths: &app-paths
+      - 'frontend/**'
+      - 'admin/**'
+      - 'vendor/**'
+      - 'roaming-wandering/frontend/**'
+      - 'roaming-wandering/admin/**'
+      - 'roaming-wandering/vendor/**'
+      - '.github/workflows/frontend-ci.yml'
+  pull_request:
+    paths: *app-paths
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [frontend, admin, vendor]
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.app }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+
+      # `ci`, not `install`: it installs exactly the lockfile and fails if the
+      # two have drifted. `install` would quietly resolve a new minor version
+      # and test something nobody is going to ship.
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        run: npx eslint . --max-warnings 0
+
+      # Vite transpiles without typechecking, so a type error would otherwise
+      # only surface in the Docker build — or not at all.
+      - name: Typecheck
+        run: npx tsc -b
+
+      - name: Test
+        # Coverage on every run, reported and never gated. Each app's
+        # `vite.config.ts` explains why at length: a percentage threshold on a
+        # UI codebase mostly measures how much JSX has been written, and the
+        # first time it blocks an urgent fix somebody adds `--no-coverage` and
+        # then nothing is measured at all. The number is printed on every run
+        # and posted to the summary below, so a drop is visible to a reviewer
+        # without being an obstacle to one.
+        run: npx vitest run --reporter=dot --coverage
+
+      - name: Report coverage
+        if: always()
+        # Read from `json-summary` rather than scraped from stdout — the text
+        # reporter's layout is not an interface, and a version bump that
+        # reformats it would silently produce an empty summary.
+        run: |
+          echo "### ${{ matrix.app }} coverage" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e '
+              const t = require("./coverage/coverage-summary.json").total
+              const row = k => `| ${k} | ${t[k].pct}% | ${t[k].covered}/${t[k].total} |`
+              console.log("| | % | covered |")
+              console.log("|---|---|---|")
+              for (const k of ["statements", "branches", "functions", "lines"]) console.log(row(k))
+            ' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '_no coverage summary produced_' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.app }}
+          path: ${{ matrix.app }}/coverage/lcov.info
+          if-no-files-found: ignore
+
+      # A build here catches what the other three steps cannot: a broken
+      # import path that only resolves in dev, a Rollup config error, an asset
+      # that does not exist. Cheaper to find now than in the image build.
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: /api/v1
+          VITE_APP_VERSION: ${{ github.sha }}
+
+      # Bundle size is a user-facing number that only ever grows unless
+      # somebody is watching it. Reported, not enforced — a hard limit gets
+      # bumped rather than investigated.
+      - name: Report bundle size
+        run: |
+          echo "### ${{ matrix.app }} bundle" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find dist/assets -name '*.js' -o -name '*.css' \
+            | xargs -r du -h \
+            | sort -rh \
+            | head -10 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Total: $(du -sh dist | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
