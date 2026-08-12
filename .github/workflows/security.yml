@@ -30,12 +30,31 @@ permissions:
   contents: read
   security-events: write
 
+# Code scanning — CodeQL, and the SARIF uploads from Trivy — needs **GitHub
+# Advanced Security** on a private repository. Without it the scan runs to
+# completion and the upload is rejected, so the job burns four minutes and then
+# fails for a reason that has nothing to do with the code.
+#
+# `CODE_SCANNING` gates those jobs. Set it to `true` in
+# *Settings → Secrets and variables → Actions → Variables* once the repository
+# is public, or once GHAS is enabled — nothing else needs to change.
+#
+# The scans still *run* when it is off. Only the upload is skipped, and the
+# findings go to the job summary instead, so the pipeline keeps its value on a
+# private repo without a licence.
+env:
+  CODE_SCANNING: ${{ vars.CODE_SCANNING == 'true' }}
+
 jobs:
   # ══════════════════════════════════════════════════════════════════════
   codeql:
     name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Skipped rather than allowed to fail. CodeQL has no output other than the
+    # upload, so running it without somewhere to put the results is four
+    # minutes of runner time for nothing.
+    if: ${{ vars.CODE_SCANNING == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +87,7 @@ jobs:
       # Filesystem mode rather than image mode: this reads the lockfiles, so it
       # sees a vulnerable transitive dependency before an image is ever built.
       - name: Scan lockfiles
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           scan-type: fs
           scan-ref: .
@@ -79,11 +98,34 @@ jobs:
           # deliberate here and deliberately *not* in release.yml.
           exit-code: '0'
 
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - name: Upload to code scanning
+        if: ${{ always() && env.CODE_SCANNING == 'true' }}
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
+
+      # Where the findings go when there is nowhere to upload them. A scan
+      # whose results are discarded is a scan nobody will notice has stopped
+      # working.
+      - name: Summarise findings
+        if: ${{ always() && env.CODE_SCANNING != 'true' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          p = pathlib.Path("trivy-fs.sarif")
+          if not p.exists():
+              print("### Dependency audit\n\n_no report produced_"); raise SystemExit
+          runs = json.loads(p.read_text()).get("runs", [])
+          results = [r for run in runs for r in run.get("results", [])]
+          print(f"### Dependency audit — {len(results)} HIGH/CRITICAL finding(s)\n")
+          for r in results[:40]:
+              rule = r.get("ruleId", "?")
+              msg = r.get("message", {}).get("text", "").splitlines()[0][:160]
+              print(f"- `{rule}` {msg}")
+          if len(results) > 40:
+              print(f"\n_…and {len(results) - 40} more._")
+          EOF
 
       # npm's own advisory database overlaps Trivy's but is not identical, and
       # the JavaScript ecosystem is where the overlap is weakest.
@@ -129,7 +171,7 @@ jobs:
       # like mistakes: a container running as root, a missing USER, a `latest`
       # tag, a secret in an ENV.
       - name: Scan Dockerfiles and compose
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           scan-type: config
           scan-ref: .
@@ -138,11 +180,32 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: '0'
 
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - name: Upload to code scanning
+        if: ${{ always() && env.CODE_SCANNING == 'true' }}
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config
+
+      - name: Summarise findings
+        if: ${{ always() && env.CODE_SCANNING != 'true' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          p = pathlib.Path("trivy-config.sarif")
+          if not p.exists():
+              print("### Infrastructure configuration\n\n_no report produced_"); raise SystemExit
+          runs = json.loads(p.read_text()).get("runs", [])
+          results = [r for run in runs for r in run.get("results", [])]
+          print(f"### Infrastructure configuration — {len(results)} HIGH/CRITICAL finding(s)\n")
+          for r in results[:40]:
+              loc = (r.get("locations") or [{}])[0]
+              path = loc.get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "?")
+              msg = r.get("message", {}).get("text", "").splitlines()[0][:140]
+              print(f"- `{path}` — {msg}")
+          if len(results) > 40:
+              print(f"\n_…and {len(results) - 40} more._")
+          EOF
 
       # The checks a scanner will not make, because they are specific to this
       # deployment. Each one is a mistake that has shipped somewhere before.

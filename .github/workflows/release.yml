@@ -123,7 +123,7 @@ jobs:
       # deployments including the ones that fix other CVEs, and the team
       # learns to pass `--skip`.
       - name: Scan for vulnerabilities
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ github.sha }}
           format: sarif
@@ -134,12 +134,26 @@ jobs:
 
       # Uploaded even when the scan failed, so the findings are readable in the
       # Security tab rather than only in a red log.
+      #
+      # Gated on `CODE_SCANNING` for the same reason as `security.yml`: the
+      # Security tab needs Advanced Security on a private repository, and
+      # without it this step fails *after* a scan that already did its job.
+      # The scan itself still gates the release — `exit-code: 1` above is what
+      # blocks a vulnerable image, and that works regardless.
       - name: Upload scan results
-        if: always()
+        if: ${{ always() && vars.CODE_SCANNING == 'true' }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-${{ matrix.image }}.sarif
           category: trivy-${{ matrix.image }}
+
+      - name: Attach scan results to the run
+        if: ${{ always() && vars.CODE_SCANNING != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.image }}
+          path: trivy-${{ matrix.image }}.sarif
+          if-no-files-found: ignore
 
       - uses: sigstore/cosign-installer@v3
 
