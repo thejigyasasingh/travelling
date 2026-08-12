@@ -1,40 +1,90 @@
 @import 'tailwindcss';
 
 /**
- * Admin tokens.
+ * Host portal tokens.
  *
  * A denser, cooler palette than the customer site, deliberately: this is a tool
  * people use for hours, and it should never be mistaken for the public product
  * in a screenshot. Slate rather than warm neutrals, tighter spacing, more
  * information per screen.
+ *
+ * **Every ramp is complete.** Tailwind v4 only generates a utility for a token
+ * that exists here, so a `border-warn-200` written against a ramp that stops at
+ * 50 produces *nothing* — no error, no border, just a card that renders flat
+ * and looks unfinished. Seven such classes were live in this app. Filling the
+ * ramps out is what makes the difference between a design that was specified
+ * and one that is actually on screen.
  */
 @theme {
-  --color-brand-50: oklch(0.97 0.02 250);
-  --color-brand-100: oklch(0.93 0.04 250);
-  --color-brand-500: oklch(0.58 0.16 255);
-  --color-brand-600: oklch(0.51 0.17 256);
-  --color-brand-700: oklch(0.44 0.15 257);
+  /* ── brand ─────────────────────────────────────────────────────────────
+     An indigo that reads as an instrument rather than a product. Saturated
+     enough to carry an active state at 600, quiet enough at 50 to tint a
+     whole sidebar without shouting. */
+  --color-brand-50: oklch(0.97 0.019 265);
+  --color-brand-100: oklch(0.94 0.036 265);
+  --color-brand-200: oklch(0.89 0.062 264);
+  --color-brand-300: oklch(0.81 0.096 263);
+  --color-brand-400: oklch(0.7 0.135 262);
+  --color-brand-500: oklch(0.6 0.163 261);
+  --color-brand-600: oklch(0.52 0.176 261);
+  --color-brand-700: oklch(0.45 0.157 262);
+  --color-brand-800: oklch(0.38 0.128 263);
+  --color-brand-900: oklch(0.31 0.098 264);
 
-  --color-ink-50: oklch(0.98 0.003 250);
-  --color-ink-100: oklch(0.96 0.004 250);
-  --color-ink-200: oklch(0.91 0.006 250);
-  --color-ink-300: oklch(0.83 0.008 250);
-  --color-ink-400: oklch(0.66 0.012 250);
-  --color-ink-500: oklch(0.54 0.014 250);
-  --color-ink-600: oklch(0.44 0.016 250);
-  --color-ink-700: oklch(0.35 0.016 250);
-  --color-ink-800: oklch(0.26 0.014 250);
-  --color-ink-900: oklch(0.17 0.012 250);
+  /* ── neutrals ──────────────────────────────────────────────────────────
+     Biased a few degrees toward the brand hue rather than pure grey. The
+     difference is barely nameable and it is what stops a dashboard reading
+     as a wireframe. */
+  --color-ink-50: oklch(0.985 0.003 265);
+  --color-ink-100: oklch(0.965 0.005 265);
+  --color-ink-200: oklch(0.925 0.008 265);
+  --color-ink-300: oklch(0.86 0.011 265);
+  --color-ink-400: oklch(0.7 0.015 265);
+  --color-ink-500: oklch(0.57 0.017 265);
+  --color-ink-600: oklch(0.47 0.018 265);
+  --color-ink-700: oklch(0.38 0.017 265);
+  --color-ink-800: oklch(0.28 0.015 265);
+  --color-ink-900: oklch(0.19 0.013 265);
 
-  --color-good-50: oklch(0.96 0.03 155);
-  --color-good-600: oklch(0.53 0.13 155);
-  --color-good-700: oklch(0.44 0.11 155);
-  --color-warn-50: oklch(0.97 0.04 85);
-  --color-warn-600: oklch(0.6 0.13 70);
-  --color-warn-700: oklch(0.5 0.12 68);
-  --color-bad-50: oklch(0.96 0.02 25);
-  --color-bad-600: oklch(0.54 0.19 25);
-  --color-bad-700: oklch(0.46 0.17 25);
+  /* ── semantic ──────────────────────────────────────────────────────────
+     Separate from the brand on purpose: "this needs you" must never be the
+     same colour as "this is selected", or a host learns to ignore both. */
+  --color-good-50: oklch(0.965 0.028 158);
+  --color-good-100: oklch(0.93 0.055 158);
+  --color-good-200: oklch(0.87 0.083 157);
+  --color-good-300: oklch(0.78 0.113 156);
+  --color-good-500: oklch(0.63 0.135 156);
+  --color-good-600: oklch(0.54 0.124 156);
+  --color-good-700: oklch(0.45 0.104 157);
+
+  --color-warn-50: oklch(0.97 0.035 82);
+  --color-warn-100: oklch(0.94 0.068 82);
+  --color-warn-200: oklch(0.89 0.1 80);
+  --color-warn-300: oklch(0.83 0.128 76);
+  --color-warn-500: oklch(0.71 0.148 68);
+  --color-warn-600: oklch(0.61 0.135 63);
+  --color-warn-700: oklch(0.5 0.115 60);
+
+  --color-bad-50: oklch(0.965 0.019 22);
+  --color-bad-100: oklch(0.93 0.038 22);
+  --color-bad-200: oklch(0.88 0.062 22);
+  --color-bad-300: oklch(0.8 0.1 23);
+  --color-bad-500: oklch(0.63 0.187 25);
+  --color-bad-600: oklch(0.55 0.192 26);
+  --color-bad-700: oklch(0.46 0.166 27);
+
+  /* ── elevation ─────────────────────────────────────────────────────────
+     Three levels and no more. Tinted with the neutral hue rather than pure
+     black, so a shadow reads as depth instead of grime — a flat black
+     shadow over a cool surface always looks slightly dirty.
+
+     `raised` is the resting state of a card, `floating` is a hover, `overlay`
+     is a menu. A card that never lifts is a card that never looks clickable. */
+  --shadow-raised: 0 1px 2px -1px oklch(0.19 0.013 265 / 0.08),
+                   0 1px 3px oklch(0.19 0.013 265 / 0.06);
+  --shadow-floating: 0 4px 6px -2px oklch(0.19 0.013 265 / 0.07),
+                     0 10px 20px -6px oklch(0.19 0.013 265 / 0.12);
+  --shadow-overlay: 0 12px 32px -8px oklch(0.19 0.013 265 / 0.22);
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
@@ -42,7 +92,7 @@
 
 @layer base {
   body {
-    @apply bg-ink-50 text-ink-800 font-sans antialiased;
+    @apply bg-ink-100 text-ink-800 font-sans antialiased;
   }
 
   /* Never removed. A keyboard user with no focus ring cannot use a table of
@@ -55,11 +105,46 @@
     *, *::before, *::after {
       animation-duration: 0.01ms !important;
       transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
     }
   }
 
   /* Numbers in a column must line up, or comparing them is guesswork. */
   .tabular {
     font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  /**
+   * The one decorative flourish in the app, used twice: the sidebar mark and
+   * the primary metric. Spent deliberately in two places rather than sprinkled
+   * — a gradient on every card is what makes a dashboard look like a template.
+   */
+  .brand-gradient {
+    background-image: linear-gradient(
+      135deg,
+      var(--color-brand-500) 0%,
+      var(--color-brand-700) 100%
+    );
+  }
+
+  /* A skeleton that shimmers rather than blinks. Blinking blocks read as a
+     broken layout; a slow sweep reads as loading. */
+  .shimmer {
+    background-image: linear-gradient(
+      90deg,
+      var(--color-ink-200) 0%,
+      var(--color-ink-100) 40%,
+      var(--color-ink-200) 80%
+    );
+    background-size: 300% 100%;
+    animation: shimmer 1.6s ease-in-out infinite;
+  }
+
+  @keyframes shimmer {
+    to {
+      background-position: -300% 0;
+    }
   }
 }
