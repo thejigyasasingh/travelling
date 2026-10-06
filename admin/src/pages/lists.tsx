@@ -2,7 +2,6 @@ import { Link } from 'react-router-dom'
 import {
   useBookings,
   usePayments,
-  useProperties,
   useUsers,
   useNotifications,
 } from '@/api/queries'
@@ -12,14 +11,19 @@ import { DataTable, FilterBar, SearchInput, Select } from '@/ui/DataTable'
 import type { Column } from '@/ui/DataTable'
 import { Badge, StatusBadge } from '@/ui/primitives'
 import { formatDate, formatDateTime, formatMinor, formatNumber, formatRelative } from '@/core/format'
-import type { AdminBooking, AdminPayment, AdminProperty, AdminUser, NotificationRow } from '@/api/types'
+import type { AdminBooking, AdminPayment, AdminUser, NotificationRow } from '@/api/types'
 
 /**
- * The five straightforward list screens.
+ * The straightforward list screens.
  *
  * Together because they are the same screen with different columns — filters in
- * the URL, offset paging, one table component. Splitting them into five files
- * would duplicate the wiring five times and let them drift apart.
+ * the URL, offset paging, one table component. Splitting them into four files
+ * would duplicate the wiring four times and let them drift apart.
+ *
+ * A screen leaves this file when it stops being a list and starts deciding
+ * something: vendors, coupons, tickets and properties each own a file, because
+ * an action needs a reason, a confirmation and a permission check, and that is
+ * more than a column definition.
  */
 
 export function BookingsPage() {
@@ -209,97 +213,6 @@ export function PaymentsPage() {
         error={query.error}
         onRetry={() => void query.refetch()}
         emptyMessage="No payments match those filters"
-        page={query.data?.meta.page}
-        pages={query.data?.meta.pages}
-        total={query.data?.meta.total}
-        onPageChange={(page) => update({ page })}
-        rowKey={(row) => row.id}
-      />
-    </>
-  )
-}
-
-export function PropertiesPage() {
-  const { filters, update } = useListFilters()
-  const query = useProperties(filters)
-
-  const columns: Column<AdminProperty>[] = [
-    {
-      key: 'name',
-      header: 'Property',
-      render: (row) => (
-        <div className="min-w-0">
-          <p className="truncate font-medium">{row.name}</p>
-          <p className="truncate text-xs text-ink-500">
-            {row.city} · {row.property_type}
-          </p>
-        </div>
-      ),
-    },
-    { key: 'status', header: 'Status', render: (row) => <StatusBadge status={row.status} /> },
-    {
-      key: 'vendor',
-      header: 'Vendor',
-      render: (row) =>
-        row.vendor_name ? (
-          <Link to={`/vendors?q=${encodeURIComponent(row.vendor_name)}`} className="text-brand-600 hover:underline">
-            {row.vendor_name}
-          </Link>
-        ) : (
-          <span className="text-ink-400">—</span>
-        ),
-    },
-    { key: 'rooms', header: 'Rooms', numeric: true, render: (row) => row.room_types },
-    {
-      key: 'rating',
-      header: 'Rating',
-      numeric: true,
-      // "New" rather than 0.0 — an unrated listing is not a badly-rated one.
-      render: (row) =>
-        row.review_count === 0 ? (
-          <span className="text-ink-400">New</span>
-        ) : (
-          `${row.review_average.toFixed(1)} (${row.review_count})`
-        ),
-    },
-    {
-      key: 'published',
-      header: 'Published',
-      render: (row) => <span className="text-xs text-ink-500">{formatDate(row.published_at)}</span>,
-    },
-  ]
-
-  return (
-    <>
-      <PageHeader title="Properties" description="Every listing, any status" />
-      <FilterBar>
-        <SearchInput
-          value={String(filters.q ?? '')}
-          onChange={(q) => update({ q })}
-          placeholder="Name or city"
-        />
-        <Select
-          label="Status"
-          value={String(filters.status ?? '')}
-          onChange={(status) => update({ status })}
-          options={[
-            { value: '', label: 'All' },
-            { value: 'draft', label: 'Draft' },
-            { value: 'pending_review', label: 'Awaiting review' },
-            { value: 'published', label: 'Published' },
-            { value: 'suspended', label: 'Suspended' },
-            { value: 'rejected', label: 'Rejected' },
-          ]}
-        />
-      </FilterBar>
-      <DataTable
-        columns={columns}
-        rows={query.data?.items ?? []}
-        isLoading={query.isPending}
-        isFetching={query.isFetching}
-        error={query.error}
-        onRetry={() => void query.refetch()}
-        emptyMessage="No listings match those filters"
         page={query.data?.meta.page}
         pages={query.data?.meta.pages}
         total={query.data?.meta.total}

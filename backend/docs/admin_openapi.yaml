@@ -1,0 +1,390 @@
+openapi: "3.0.3"
+info:
+  title: Admin API (Admin Panel)
+  description: OpenAPI specification for the admin panel endpoints used by the admin frontend.
+  version: "1.0.0"
+servers:
+  - url: https://api.example.com/api/v1
+    description: Production API (replace with your actual server)
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    PageMetaResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+        pages:
+          type: integer
+    DashboardResponse:
+      type: object
+    AnalyticsResponse:
+      type: object
+    AdminUserListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        meta:
+          $ref: '#/components/schemas/PageMetaResponse'
+    AdminPropertyListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        meta:
+          $ref: '#/components/schemas/PageMetaResponse'
+    AdminBookingListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        meta:
+          $ref: '#/components/schemas/PageMetaResponse'
+    AdminPaymentListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        meta:
+          $ref: '#/components/schemas/PageMetaResponse'
+    AdminVendorListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        meta:
+          $ref: '#/components/schemas/PageMetaResponse'
+    NotificationListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        meta:
+          $ref: '#/components/schemas/PageMetaResponse'
+
+paths:
+  /admin/dashboard:
+    get:
+      tags:
+        - admin
+      summary: Everything on the landing screen
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: window_days
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 90
+            default: 30
+      responses:
+        '200':
+          description: Dashboard payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardResponse'
+
+  /admin/analytics:
+    get:
+      tags:
+        - admin
+      summary: Revenue and demand for a period
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: to_date
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Analytics payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsResponse'
+
+  /admin/users:
+    get:
+      tags:
+        - admin
+      summary: Guests and staff
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: role
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: User list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserListResponse'
+
+  /admin/properties:
+    get:
+      tags:
+        - admin
+      summary: Every listing, any status
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: vendor_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Property list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPropertyListResponse'
+
+  /admin/bookings:
+    get:
+      tags:
+        - admin
+      summary: Every booking
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: property_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: from_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: to_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Booking list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminBookingListResponse'
+
+  /admin/payments:
+    get:
+      tags:
+        - admin
+      summary: Every payment
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Payment list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPaymentListResponse'
+
+  /admin/vendors:
+    get:
+      tags:
+        - admin
+      summary: Vendor accounts and their applications
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Vendor list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminVendorListResponse'
+
+  /admin/notifications:
+    get:
+      tags:
+        - admin
+      summary: What the platform has sent
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: template
+          in: query
+          schema:
+            type: string
+        - name: recipient
+          in: query
+          schema:
+            type: string
+            maxLength: 320
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Notification list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'

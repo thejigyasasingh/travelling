@@ -6,9 +6,9 @@ import {
   BookingsPage,
   NotificationsPage,
   PaymentsPage,
-  PropertiesPage,
   UsersPage,
 } from '@/pages/lists'
+import { PropertiesPage } from '@/pages/PropertiesPage'
 import { VendorsPage } from '@/pages/VendorsPage'
 import { CouponsPage } from '@/pages/CouponsPage'
 import { TicketsPage } from '@/pages/TicketsPage'

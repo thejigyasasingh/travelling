@@ -38,8 +38,9 @@ panels.
 
 The permissions come from the RBAC catalogue the backend already had:
 `user:read:any`, `booking:read:any`, `payment:read:any`, `vendor:approve:any`,
-`ticket:read:any`, `ticket:resolve:any`. Analytics is gated on payment access
-rather than booking access, because it shows fees and vendor payables.
+`property:publish:any`, `ticket:read:any`, `ticket:resolve:any`. Analytics is
+gated on payment access rather than booking access, because it shows fees and
+vendor payables.
 
 ## The decisions that matter
 
@@ -63,6 +64,15 @@ to reproduce.
 behave identically across ten screens rather than being re-invented per page —
 and a table that shows "no results" when the request actually failed teaches an
 admin to distrust the screen.
+
+**A moderation screen never offers an action the server will refuse.**
+`moderationActions()` on the properties page mirrors the listing transition
+table — approve and reject only from `pending_review`, suspend only from
+`published` or `unpublished` — and an unrecognised status offers nothing rather
+than guessing. A button that returns a transition error is worse than a missing
+one: the admin presses it, reads the error, stops trusting every other button,
+and asks engineering to change the row directly. The server still enforces all
+of it; this is so the screen and the server agree about what is possible.
 
 **A 403 gets no retry button.** Retrying will not grant a permission, and a
 button that does nothing teaches people that buttons lie.
